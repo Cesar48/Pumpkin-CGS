@@ -1,3 +1,4 @@
+mod monitors;
 mod outputs;
 pub(crate) mod solver;
 
@@ -78,6 +79,7 @@ pub mod options {
     pub use crate::propagators::CumulativeExplanationType;
     pub use crate::propagators::CumulativeOptions;
     pub use crate::propagators::CumulativePropagationMethod;
+    pub use crate::solver::CoreGuidedArgs;
     #[cfg(doc)]
     use crate::Solver;
 }

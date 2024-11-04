@@ -32,6 +32,7 @@ use self::instance::FlatZincInstance;
 use self::instance::FlatzincObjective;
 use self::instance::Output;
 use crate::flatzinc::error::FlatZincError;
+use crate::CoreGuidedArgs;
 
 const MSG_UNKNOWN: &str = "=====UNKNOWN=====";
 const MSG_UNSATISFIABLE: &str = "=====UNSATISFIABLE=====";
@@ -66,6 +67,7 @@ pub(crate) fn solve(
     instance: impl AsRef<Path>,
     time_limit: Option<Duration>,
     options: FlatZincOptions,
+    core_guided_options: Option<CoreGuidedArgs>,
 ) -> Result<(), FlatZincError> {
     let instance = File::open(instance)?;
 
@@ -97,12 +99,20 @@ pub(crate) fn solve(
 
     let value = if let Some(objective_function) = &instance.objective_function {
         let result = match objective_function {
-            FlatzincObjective::Maximize(domain_id) => {
-                solver.maximise(&mut brancher, &mut termination, *domain_id)
-            }
-            FlatzincObjective::Minimize(domain_id) => {
-                solver.minimise(&mut brancher, &mut termination, *domain_id)
-            }
+            FlatzincObjective::Maximize(domain_id) => solver.maximise(
+                &mut brancher,
+                &mut termination,
+                *domain_id,
+                core_guided_options,
+                instance.objective_definition,
+            ),
+            FlatzincObjective::Minimize(domain_id) => solver.minimise(
+                &mut brancher,
+                &mut termination,
+                *domain_id,
+                core_guided_options,
+                instance.objective_definition,
+            ),
         };
 
         match result {

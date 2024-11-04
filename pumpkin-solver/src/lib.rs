@@ -140,8 +140,15 @@
 //! # solver.add_constraint(constraints::maximum(vec![x, y, z], objective)).post();
 //! # let mut termination = Indefinite;
 //! # let mut brancher = solver.default_brancher_over_all_propositional_variables();
-//! // Then we solve to optimality
-//! let result = solver.minimise(&mut brancher, &mut termination, objective);
+//! // Then we solve to optimality (with core-guided search disabled)
+//! let (core_guided_args, objective_definition) = (None, None);
+//! let result = solver.minimise(
+//!     &mut brancher,
+//!     &mut termination,
+//!     objective,
+//!     core_guided_args,
+//!     objective_definition,
+//! );
 //!
 //! if let OptimisationResult::Optimal(optimal_solution) = result {
 //!     let value_x = optimal_solution.get_integer_value(x);

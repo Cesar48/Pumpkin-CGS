@@ -345,6 +345,39 @@ struct Args {
     /// Possible values: bool
     #[arg(long = "cumulative-incremental-backtracking")]
     cumulative_incremental_backtracking: bool,
+
+    /// The following arguments are specifically core-guided
+
+    /// Specify whether to use core-guided search, instead of linear search.
+    #[arg(long = "core-guided", default_value_t = false)]
+    core_guided: bool,
+
+    /// When using core-guided search, specifies to use variable-based reformulations
+    /// rather than slice-based reformulations
+    #[arg(long = "reform-var", default_value_t = false)]
+    variable_reformulation: bool,
+
+    /// When using core-guided search, specifies to use coefficient elimination
+    /// rather than weight splitting
+    #[arg(long = "coef-elim", default_value_t = false)]
+    coefficient_elimination: bool,
+
+    /// In core-guided search, we can apply Disjoint Core Extraction.
+    /// This causes several cores to be extracted in between (completed) reformulations.
+    /// This argument determines whether WCE is applied.
+    #[arg(long = "wce", default_value_t = false)]
+    weight_aware_cores: bool,
+
+    /// In core-guided search, we can apply stratification, to consider high-weighing strata
+    /// (i.e. groups of objective variables) before low-weighing strata.
+    /// This argument specifies whether strata are used.
+    #[arg(long = "strat", default_value_t = false)]
+    stratification: bool,
+
+    /// In core-guided search, we can apply hardening if intermediate solutions are found.
+    /// This argument specifies whether to do so.
+    #[arg(long = "harden", default_value_t = false)]
+    harden: bool,
 }
 
 fn configure_logging(
@@ -517,6 +550,18 @@ fn run() -> PumpkinResult<()> {
         .to_str()
         .ok_or(PumpkinError::invalid_instance(args.instance_path.display()))?;
 
+    let cg_args = if args.core_guided {
+        Some(CoreGuidedArgs {
+            variable_reformulation: args.variable_reformulation,
+            coefficient_elimination: args.coefficient_elimination,
+            weight_aware_cores: args.weight_aware_cores,
+            stratification: args.stratification,
+            harden: args.harden,
+        })
+    } else {
+        None
+    };
+
     match file_format {
         FileFormat::CnfDimacsPLine => {
             cnf_problem(learning_options, solver_options, time_limit, instance_path)?
@@ -543,6 +588,7 @@ fn run() -> PumpkinResult<()> {
                     args.cumulative_incremental_backtracking,
                 ),
             },
+            cg_args,
         )?,
     }
 

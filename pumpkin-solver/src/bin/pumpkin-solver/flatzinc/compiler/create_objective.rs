@@ -8,10 +8,10 @@ use crate::flatzinc::ast::FlatZincAst;
 use crate::flatzinc::instance::FlatzincObjective;
 use crate::flatzinc::FlatZincError;
 
-pub(crate) fn run(
-    ast: &FlatZincAst,
+pub(crate) fn run<'a>(
+    ast: &'a FlatZincAst,
     context: &mut CompilationContext,
-) -> Result<Option<FlatzincObjective>, FlatZincError> {
+) -> Result<Option<(FlatzincObjective, &'a String)>, FlatZincError> {
     match &ast.solve_item.goal {
         Goal::Satisfy => Ok(None),
         Goal::OptimizeBool(optimization_type, bool_expr) => {
@@ -19,23 +19,27 @@ pub(crate) fn run(
             // it will find For now we assume that the objective function is a single
             // integer
 
-            let domain = match bool_expr {
+            let (domain, name) = match bool_expr {
                 BoolExpr::Bool(_) => unreachable!(
                     "We do not expect a constant to be present in the objective function!"
                 ),
-                BoolExpr::VarParIdentifier(x) => {
-                    if context.is_identifier_parameter(x) {
-                        context.resolve_integer_constant_from_id(x)?
+                BoolExpr::VarParIdentifier(name) => {
+                    let res = if context.is_identifier_parameter(name) {
+                        context.resolve_integer_constant_from_id(name)?
                     } else {
-                        context.resolve_integer_variable_from_identifier(x)?
-                    }
+                        context.resolve_integer_variable_from_identifier(name)?
+                    };
+                    (res, name)
                 }
             };
 
-            Ok(Some(match optimization_type {
-                flatzinc::OptimizationType::Minimize => FlatzincObjective::Minimize(domain),
-                flatzinc::OptimizationType::Maximize => FlatzincObjective::Maximize(domain),
-            }))
+            Ok(Some((
+                match optimization_type {
+                    flatzinc::OptimizationType::Minimize => FlatzincObjective::Minimize(domain),
+                    flatzinc::OptimizationType::Maximize => FlatzincObjective::Maximize(domain),
+                },
+                name,
+            )))
         }
         _ => todo!(
             "For now we assume that the optimisation function is a single integer to optimise"

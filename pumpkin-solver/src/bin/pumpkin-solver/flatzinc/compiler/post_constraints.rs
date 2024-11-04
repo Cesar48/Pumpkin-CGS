@@ -14,6 +14,7 @@ use pumpkin_solver::variables::TransformableVariable;
 use super::context::CompilationContext;
 use crate::flatzinc::ast::FlatZincAst;
 use crate::flatzinc::compiler::context::Set;
+use crate::flatzinc::instance::FlatzincObjective;
 use crate::flatzinc::FlatZincError;
 use crate::flatzinc::FlatZincOptions;
 
@@ -21,9 +22,27 @@ pub(crate) fn run(
     ast: &FlatZincAst,
     context: &mut CompilationContext,
     options: FlatZincOptions,
-) -> Result<(), FlatZincError> {
+    objective_function: &Option<(FlatzincObjective, &String)>,
+) -> Result<Option<Vec<(i32, DomainId)>>, FlatZincError> {
+    let mut objective_definition = None;
+
     for constraint_item in &ast.constraint_decls {
         let flatzinc::ConstraintItem { id, exprs, annos } = constraint_item;
+
+        if let Some((obj, obj_name)) = objective_function {
+            // If there is an objective function, look for a definition in the annotations
+            if contains_objective_definition(annos, obj_name) && *id == "int_lin_eq" {
+                if objective_definition.is_some() {
+                    // If a variable is defined multiple times, we are unsure what to do, and panic
+                    panic!("Objective already defined; ambiguous definition!")
+                }
+                objective_definition = Some(process_objective_definition(
+                    &context.resolve_array_integer_constants(&exprs[0])?,
+                    &context.resolve_integer_variable_array(&exprs[1])?,
+                    obj,
+                ));
+            }
+        }
 
         let is_satisfiable: bool = match id.as_str() {
             "array_int_maximum" => compile_array_int_maximum(context, exprs)?,
@@ -209,7 +228,7 @@ pub(crate) fn run(
         }
     }
 
-    Ok(())
+    Ok(objective_definition)
 }
 
 macro_rules! check_parameters {
@@ -708,4 +727,68 @@ fn compile_all_different(
     Ok(constraints::all_different(variables)
         .post(context.solver, None)
         .is_ok())
+}
+
+fn contains_objective_definition(
+    annotations: &[flatzinc::Annotation],
+    objective_name: &String,
+) -> bool {
+    let res = annotations
+        .iter()
+        // First, extract all expressions that define variables
+        .filter_map(|anno| match anno {
+            flatzinc::Annotation {
+                id,
+                expressions: exprs,
+            } if id == "defines_var" => Some(exprs),
+            _ => None,
+        })
+        .flatten()
+        // Extract VarParIdentifiers (parsed definition anno) and their associated identifiers
+        .find(|ann_expr| match ann_expr {
+            flatzinc::AnnExpr::Expr(flatzinc::Expr::VarParIdentifier(x)) => x == objective_name,
+            _ => false,
+        });
+
+    // If there are results, the current constraint defines the objective variable
+    res.is_some()
+}
+
+fn process_objective_definition(
+    original_weights: &[i32],
+    original_vars: &[DomainId],
+    objective_variable: &FlatzincObjective,
+) -> Vec<(i32, DomainId)> {
+    // Save this constraint for later use
+    // Note: 'later' is during the solve process, after compilation,
+    // and as such the values need to be copied to extend lifetime
+    let mut weights: Vec<i32> = original_weights.to_owned();
+    let mut variables: Vec<DomainId> = original_vars.to_owned();
+
+    // Check if the definition is in the expected format;
+    // objective variable must have a negative coefficient
+    // obj = a+b+c <=> a+b+c - obj = 0
+    let obj_variable_idx = variables
+        .iter()
+        // Find DomainId associated with objective value
+        .position(|did| did == objective_variable.get_domain())
+        .expect("Objective variable must be present in own definition");
+    if weights[obj_variable_idx] > 0 {
+        // If the objective variable has a positive weight, we invert the weights.
+        // Note that scaling is unimportant;
+        // minimise obj = 5a + 3b === minimise 10obj = 50a + 30b
+        for i in &mut weights {
+            *i *= -1;
+        }
+    }
+
+    // Remove the objective value itself
+    let _ = variables.remove(obj_variable_idx);
+    let _ = weights.remove(obj_variable_idx);
+
+    weights
+        .iter()
+        .zip(variables.iter())
+        .map(|(&w, &v)| (w, v))
+        .collect()
 }
