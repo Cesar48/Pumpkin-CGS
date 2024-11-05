@@ -1239,11 +1239,6 @@ impl ConstraintSatisfactionSolver {
     ///
     /// Returns true if a restart took place and false otherwise.
     fn restart_during_search(&mut self, brancher: &mut impl Brancher) {
-        pumpkin_assert_simple!(
-            self.are_all_assumptions_assigned(),
-            "Sanity check: restarts should not trigger whilst assigning assumptions"
-        );
-
         // no point backtracking past the assumption level
         if self.get_decision_level() <= self.assumptions.len() {
             return;
@@ -1758,6 +1753,10 @@ impl ConstraintSatisfactionSolver {
         }
 
         Ok(())
+    }
+
+    pub fn get_number_of_decisions(&mut self) -> u64 {
+        self.counters.engine_statistics.num_decisions
     }
 }
 

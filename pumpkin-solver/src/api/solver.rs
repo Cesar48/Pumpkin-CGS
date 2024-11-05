@@ -1305,8 +1305,9 @@ impl Solver {
             .zip(lb_res.iter().skip(1))
             .map(|(&(first_lb, _), &(second_lb, _))| *second_lb - *first_lb)
             .collect();
-        // xs are the number of cores, ys are the lower bound increases
+        let lb_step_size = *lb_last_result.0 as f32 / lb_len as f32;
 
+        // xs are the number of cores, ys are the lower bound increases
         let (xy, x2): (Vec<i32>, Vec<i32>) = lb_incs
             .iter()
             .enumerate()
@@ -1317,6 +1318,7 @@ impl Solver {
             - sum_x * lb_incs.iter().sum::<i32>()) as f64
             / (lb_len as i32 * x2.iter().sum::<i32>() - sum_x * sum_x) as f64;
 
+        let core_size = core_res.iter().sum::<usize>() as f32 / core_len as f32;
         // xs are the number of cores, ys are the core sizes
         let (xy, x2): (Vec<i32>, Vec<i32>) = core_res
             .iter()
@@ -1327,6 +1329,16 @@ impl Solver {
         let sum_y = core_res.iter().map(|a| *a as i32).sum::<i32>();
         let slope_core = (core_len as i32 * xy.iter().sum::<i32>() - sum_x * sum_y) as f64
             / (core_len as i32 * x2.iter().sum::<i32>() - sum_x * sum_x) as f64;
+
+        let time_solv = **task_res.get(&MonitoredTasks::Solving).unwrap_or(&&0);
+        let time_core = **task_res.get(&MonitoredTasks::CoreProcessing).unwrap_or(&&0);
+        let time_spec = **task_res.get(&MonitoredTasks::WCEAdditions).unwrap_or(&&0)
+            + **task_res.get(&MonitoredTasks::StrataCreation).unwrap_or(&&0);
+
+        let core_per_reform = wce_res.iter().sum::<usize>() as f32 / wce_res.len() as f32;
+
+        let unhard_fraction = hard_res.iter().product::<f32>();
+        let exh_fraction = exh_res.iter().product::<f32>();
 
         println!(
             "This is summarised in the following data points:\n\
@@ -1343,23 +1355,34 @@ impl Solver {
             Total Unhardened Fraction: {:?}\n\
             Total Relative Increase of Exhaustion: {:?}",
             lb_len,
-            *lb_last_result.0 as f32 / lb_len as f32,
+            lb_step_size,
             *lb_last_result.1 as f32 / lb_len as f32, // final value / #steps = average step
             slope_lb,
-            core_res.iter().sum::<usize>() as f32 / core_len as f32,
+            core_size,
             slope_core,
-            task_res
-                .get(&MonitoredTasks::Solving)
-                .expect("Expected time spent solving"),
-            task_res
-                .get(&MonitoredTasks::CoreProcessing)
-                .expect("Expected time spent processing"),
-            **task_res.get(&MonitoredTasks::WCEAdditions).unwrap_or(&&0)
-                + **task_res.get(&MonitoredTasks::StrataCreation).unwrap_or(&&0),
-            wce_res.iter().sum::<usize>() as f32 / wce_res.len() as f32,
-            hard_res.iter().product::<f32>(),
-            exh_res.iter().product::<f32>(),
+            time_solv,
+            time_core,
+            time_spec,
+            core_per_reform,
+            unhard_fraction,
+            exh_fraction,
         );
+
+        let obj = if let Some(s) = &solution {
+            s.lower_bound(&objective_variable) as f32
+        } else {
+            f32::NAN
+        };
+        let is_optimal = proven && (!obj.is_nan());
+        let obj_of_optimal = if is_optimal { obj } else { f32::NAN };
+
+        let total_time = time_solv + time_core + time_spec;
+        let nnodes = self.satisfaction_solver.get_number_of_decisions();
+
+        println!("-=- CSV version -=-");
+        println!("lb_nstep;lb_size;lb_slope;core_size;core_slope;time_solv;time_core;time_special;ncore_reform;unhard_frac;exh_frac;obj;is_optimal;optimal_found_value;nnodes;total_time");
+        println!("{lb_len};{lb_step_size};{slope_lb};{core_size};{slope_core};{time_solv};{time_core};{time_spec};{core_per_reform};{unhard_fraction};{exh_fraction};{obj};{is_optimal};{obj_of_optimal};{nnodes};{total_time}");
+        println!("-=- End of CSV -=-");
 
         match (solution, proven) {
             // If a solution has been found, and was proven to be optimal, return it as the
@@ -1727,13 +1750,11 @@ impl Solver {
                 } = *dec_lit;
                 debug!("Variable {} now has 0 weight", variable);
                 // Mark old assumption for removal.
-                to_remove.push(
-                    self.get_literal(if is_greater {
-                        predicate!(variable >= bound)
-                    } else {
-                        predicate!(variable <= bound)
-                    }),
-                );
+                to_remove.push(self.get_literal(if is_greater {
+                    predicate!(variable >= bound)
+                } else {
+                    predicate!(variable <= bound)
+                }));
 
                 if add_next_slice {
                     debug!("Adding next slice and resetting weight to {}", w.1);
