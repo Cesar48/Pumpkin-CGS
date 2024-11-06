@@ -23,7 +23,7 @@ pub(crate) fn run(
     context: &mut CompilationContext,
     options: FlatZincOptions,
     objective_function: &Option<(FlatzincObjective, &String)>,
-) -> Result<Option<Vec<(i32, DomainId)>>, FlatZincError> {
+) -> Result<Option<(Vec<(i32, DomainId)>, i32)>, FlatZincError> {
     let mut objective_definition = None;
 
     for constraint_item in &ast.constraint_decls {
@@ -39,6 +39,7 @@ pub(crate) fn run(
                 objective_definition = Some(process_objective_definition(
                     &context.resolve_array_integer_constants(&exprs[0])?,
                     &context.resolve_integer_variable_array(&exprs[1])?,
+                    &context.resolve_integer_constant_from_expr(&exprs[2])?,
                     obj,
                 ));
             }
@@ -757,13 +758,15 @@ fn contains_objective_definition(
 fn process_objective_definition(
     original_weights: &[i32],
     original_vars: &[DomainId],
+    original_bias: &i32,
     objective_variable: &FlatzincObjective,
-) -> Vec<(i32, DomainId)> {
+) -> (Vec<(i32, DomainId)>, i32) {
     // Save this constraint for later use
     // Note: 'later' is during the solve process, after compilation,
     // and as such the values need to be copied to extend lifetime
     let mut weights: Vec<i32> = original_weights.to_owned();
     let mut variables: Vec<DomainId> = original_vars.to_owned();
+    let mut bias: i32 = original_bias.to_owned();
 
     // Check if the definition is in the expected format;
     // objective variable must have a negative coefficient
@@ -780,15 +783,17 @@ fn process_objective_definition(
         for i in &mut weights {
             *i *= -1;
         }
+        bias *= -1;
     }
 
     // Remove the objective value itself
     let _ = variables.remove(obj_variable_idx);
     let _ = weights.remove(obj_variable_idx);
 
-    weights
+    (weights
         .iter()
         .zip(variables.iter())
         .map(|(&w, &v)| (w, v))
-        .collect()
+        .collect(),
+     bias)
 }

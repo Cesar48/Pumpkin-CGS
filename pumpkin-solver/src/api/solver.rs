@@ -471,19 +471,20 @@ impl Solver {
         termination: &mut impl TerminationCondition,
         objective_variable: DomainId,
         core_guided_options: Option<CoreGuidedArgs>,
-        objective_definition: Option<Vec<(i32, DomainId)>>,
+        objective_definition: Option<(Vec<(i32, DomainId)>, i32)>,
     ) -> OptimisationResult {
         match core_guided_options {
             Some(x) => {
-                let true_objective = match objective_definition {
+                let (true_objective, bias) = match objective_definition {
                     Some(y) => y,
-                    None => vec![(1_i32, objective_variable)],
+                    None => (vec![(1_i32, objective_variable)], 0),
                 };
                 self.minimise_internal_cgs(
                     brancher,
                     termination,
                     x,
                     true_objective,
+                    bias,
                     objective_variable,
                     false,
                 )
@@ -504,19 +505,20 @@ impl Solver {
         termination: &mut impl TerminationCondition,
         objective_variable: DomainId,
         core_guided_options: Option<CoreGuidedArgs>,
-        objective_definition: Option<Vec<(i32, DomainId)>>,
+        objective_definition: Option<(Vec<(i32, DomainId)>, i32)>,
     ) -> OptimisationResult {
         match core_guided_options {
             Some(x) => {
-                let true_objective = match objective_definition {
-                    Some(y) => y.into_iter().map(|(w, v)| (-w, v)).collect(),
-                    None => vec![(-1_i32, objective_variable)],
+                let (true_objective, bias) = match objective_definition {
+                    Some(y) => (y.0.into_iter().map(|(w, v)| (-w, v)).collect(), y.1),
+                    None => (vec![(-1_i32, objective_variable)], 0),
                 };
                 self.minimise_internal_cgs(
                     brancher,
                     termination,
                     x,
                     true_objective,
+                    bias,
                     objective_variable,
                     true,
                 )
@@ -965,6 +967,7 @@ impl Solver {
         termination: &mut impl TerminationCondition,
         core_guided_options: CoreGuidedArgs,
         objective_function: Vec<(i32, DomainId)>,
+        bias: i32,
         objective_variable: DomainId,
         _is_maximising: bool,
     ) -> OptimisationResult {
@@ -1234,38 +1237,46 @@ impl Solver {
                 // Hardening: add the upper bounds explicitly.
                 if core_guided_options.harden {
                     let mapped_obj_val = sol.lower_bound(&signed_objective);
-                    debug!("Hardening obj to {}", mapped_obj_val);
-                    // Harden the full objective; useful for inference.
-                    less_than_or_equals(vec![signed_objective.clone()], mapped_obj_val)
-                        .post(self, None)
-                        .expect("Could not harden");
+                    let ub = self.upper_bound(&signed_objective);
+                    if mapped_obj_val < self.upper_bound(&signed_objective) {
+                        debug!("Hardening obj to [{}, {}] (was {})", self.lower_bound(&signed_objective), mapped_obj_val, ub);
 
-                    // Calculate the domain gap and use this to calculate the new domain sizes
-                    // of each variable (for statistics, as well as through constraints)
-                    // Note: we CANNOT use the lower bound estimate for this, as parts of its cost
-                    // are not reflected in the objective variables.
-                    let inferred_lb = objective_function
-                        .iter()
-                        .map(|(w, did)| self.lower_bound(did) * w)
-                        .sum::<i32>();
-                    let gap = mapped_obj_val - inferred_lb;
-                    let fraction: f32 = objective_function
-                        .iter()
-                        .map(|(w, did)| {
-                            (self.upper_bound(did) - self.lower_bound(did) + 1) as f32
-                                / (gap / w.abs() + 1) as f32
-                        })
-                        .filter(|frac| *frac < 1.0)
-                        .product();
-                    hard_stat.hardened(fraction);
-                    // Add aforementioned constraints.
-                    for (w, did) in &objective_function {
-                        let scaled = did.scaled(*w);
-                        let bound = self.lower_bound(&scaled) + gap;
-                        if self.upper_bound(&scaled) > bound {
-                            less_than_or_equals(vec![scaled], bound)
-                                .post(self, None)
-                                .expect("Could not add hardening element");
+                        // Harden the full objective; useful for inference.
+                        self.satisfaction_solver.harden_upper_bound(&signed_objective, mapped_obj_val).expect("Could not harden");
+
+                        // Calculate the domain gap and use this to calculate the new domain sizes
+                        // of each variable (for statistics, as well as through constraints)
+                        // Note: we CANNOT use the lower bound estimate for this, as  WCE or
+                        // stratification might cause it to be too low.
+                        // Note: it is also much harder to harden reformulation variables, as their
+                        // lower bounds may not be reflected in the inferred_lb.
+                        let inferred_lb = objective_function
+                            .iter()
+                            .map(|(w, did)| self.lower_bound(&did.scaled(*w)))
+                            .sum::<i32>() - bias;
+                        let gap = mapped_obj_val - inferred_lb;
+                        debug!("Gap is {} - {} = {}", mapped_obj_val, inferred_lb, gap);
+                        let fraction: f32 = objective_function
+                            .iter()
+                            .map(|(w, did)| {
+                                (self.upper_bound(did) - self.lower_bound(did) + 1) as f32
+                                    / (gap / w.abs() + 1) as f32
+                            })
+                            .filter(|frac| *frac < 1.0)
+                            .product();
+                        hard_stat.hardened(fraction);
+                        // Add aforementioned constraints.
+                        for (w, did) in &objective_function {
+                            let scaled = did.scaled(*w);
+                            // Any variable can in theory increase obj by ub_{scaled} - lb_{scaled}.
+                            // In other words, if obj can increase at most X, we know that
+                            // ub_{scaled} - lb_{scaled} \leq X --> ub_{scaled} \leq lb_{scaled} + X
+                            let (lb, ub) = (self.lower_bound(&scaled), self.upper_bound(&scaled));
+                            let bound = lb + gap;
+                            if ub > bound {
+                                debug!("Hardening {} to [{}, {}] (was {})", did, lb, bound, ub);
+                                self.satisfaction_solver.harden_upper_bound(&scaled, bound).expect("Could not harden element");
+                            }
                         }
                     }
                 }

@@ -30,7 +30,7 @@ pub(crate) struct FlatZincInstance {
     pub(super) outputs: Vec<Output>,
     pub(super) objective_function: Option<FlatzincObjective>,
     pub(super) search: Option<DynamicBrancher>,
-    pub(super) objective_definition: Option<Vec<(i32, DomainId)>>,
+    pub(super) objective_definition: Option<(Vec<(i32, DomainId)>, i32)>,
 }
 
 impl FlatZincInstance {

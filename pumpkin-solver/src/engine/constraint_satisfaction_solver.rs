@@ -812,6 +812,18 @@ impl ConstraintSatisfactionSolver {
         variable.upper_bound(&self.assignments_integer)
     }
 
+    /// Get the upper bound for the given variable.
+    pub fn harden_upper_bound(&mut self, variable: &impl IntegerVariable, new_ub: i32) -> Result<(), EmptyDomain> {
+        //TODO add reason?
+        variable.set_upper_bound(&mut self.assignments_integer, new_ub, None)
+    }
+
+    /// Get the upper bound for the given variable.
+    pub fn harden_lower_bound(&mut self, variable: &impl IntegerVariable, new_lb: i32) -> Result<(), EmptyDomain> {
+        //TODO add reason?
+        variable.set_upper_bound(&mut self.assignments_integer, new_lb, None)
+    }
+
     /// Determine whether `value` is in the domain of `variable`.
     pub fn integer_variable_contains(&self, variable: &impl IntegerVariable, value: i32) -> bool {
         variable.contains(&self.assignments_integer, value)
