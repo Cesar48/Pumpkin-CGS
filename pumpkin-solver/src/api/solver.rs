@@ -1028,15 +1028,16 @@ impl Solver {
         // This boolean signals whether the result of the solver is 'final'; if a solution is found
         // with no information left to be added, or if unconditional unsatisfiability is found.
         let mut proven = false;
-        // Keep track of the lower bound on the objective, as governed by the assumptions.
-        // NOTE: this assumes there is no bias in the objective variable. If the domain is
-        // explicitly limited, or the definition of the objective variable includes a bias term,
-        // the value calculated here is incorrect.
         let signed_objective = objective_variable.scaled(match _is_maximising {
             true => -1,
             false => 1,
         });
-        let mut current_lower_bound = self.lower_bound(&signed_objective);
+        // Keep track of the lower bound on the objective, as governed by the assumptions.
+        // Note: this is `bias` off from the actual lower bound (as proven)
+        let mut current_lower_bound = objective_function
+            .iter()
+            .map(|(w, did)| self.lower_bound(&did.scaled(*w)))
+            .sum::<i32>();
         debug!("Initializing lower bound as {}", current_lower_bound);
 
         let mut weights_per_var: HashMap<u32, (i32, i32)> = HashMap::from(
@@ -1053,43 +1054,33 @@ impl Solver {
 
         // Repeat until satisfiable
         loop {
-            // Check if the current assumed objective value is still below the (true) upper bound
-            if current_lower_bound < self.lower_bound(&signed_objective) {
-                warn!(
-                    "Warn! LB estimate under-estimates: {} instead of {}; delayed info? {}",
-                    current_lower_bound,
-                    self.lower_bound(&signed_objective),
-                    !unadded_parts_of_objective_function.is_empty()
-                        || !delayed_assumptions.is_empty(),
-                );
-                if !unadded_parts_of_objective_function.is_empty()
-                    || !delayed_assumptions.is_empty()
-                {
-                    debug!("Not updating LB estimate due to delayed info");
-                } else {
-                    debug!("Updating LB estimate to current lower bound");
-                    current_lower_bound = self.lower_bound(&signed_objective);
-                }
-            }
-
             let (actual_lb, actual_ub) = (
                 self.lower_bound(&signed_objective),
                 self.upper_bound(&signed_objective),
             );
+
             // Update lower bound every iteration
             lb_stat.update(current_lower_bound);
 
-            if current_lower_bound > actual_ub
+            if current_lower_bound - bias > actual_ub
                 || actual_lb > actual_ub
                 || assumptions.contains(&Literal::u32_to_literal(0))
             {
                 info!("Stopping solving process due to violated bounds");
                 debug!(
                     "est. lb > ub: {}; act. lb > ub: {}; assume false: {}",
-                    current_lower_bound > actual_ub,
+                    current_lower_bound - bias > actual_ub,
                     actual_lb > actual_ub,
                     assumptions.contains(&Literal::u32_to_literal(0)),
                 );
+                proven = solution.is_none();
+                if !proven {
+                    warn!(
+                        "A solution has been found before UNSAT; closer inspection \
+                        required. Note: hardening was {}",
+                        core_guided_options.harden,
+                    );
+                }
                 break;
             }
 
@@ -1239,10 +1230,20 @@ impl Solver {
                     let mapped_obj_val = sol.lower_bound(&signed_objective);
                     let ub = self.upper_bound(&signed_objective);
                     if mapped_obj_val < self.upper_bound(&signed_objective) {
-                        debug!("Hardening obj to [{}, {}] (was {})", self.lower_bound(&signed_objective), mapped_obj_val, ub);
+                        debug!(
+                            "Hardening obj to [{}, {}] (was {})",
+                            self.lower_bound(&signed_objective),
+                            mapped_obj_val,
+                            ub
+                        );
 
                         // Harden the full objective; useful for inference.
-                        self.satisfaction_solver.harden_upper_bound(&signed_objective, mapped_obj_val).expect("Could not harden");
+                        // self.satisfaction_solver.harden_upper_bound(&signed_objective,
+                        // mapped_obj_val).expect("Could not harden");
+                        self.add_clause(vec![
+                            self.get_literal(predicate!(signed_objective <= mapped_obj_val))
+                        ])
+                        .expect("Could not harden");
 
                         // Calculate the domain gap and use this to calculate the new domain sizes
                         // of each variable (for statistics, as well as through constraints)
@@ -1253,7 +1254,8 @@ impl Solver {
                         let inferred_lb = objective_function
                             .iter()
                             .map(|(w, did)| self.lower_bound(&did.scaled(*w)))
-                            .sum::<i32>() - bias;
+                            .sum::<i32>()
+                            - bias;
                         let gap = mapped_obj_val - inferred_lb;
                         debug!("Gap is {} - {} = {}", mapped_obj_val, inferred_lb, gap);
                         let fraction: f32 = objective_function
@@ -1275,7 +1277,12 @@ impl Solver {
                             let bound = lb + gap;
                             if ub > bound {
                                 debug!("Hardening {} to [{}, {}] (was {})", did, lb, bound, ub);
-                                self.satisfaction_solver.harden_upper_bound(&scaled, bound).expect("Could not harden element");
+                                self.add_clause(
+                                    vec![self.get_literal(predicate!(scaled <= bound))],
+                                )
+                                .expect("Could not harden");
+                                // self.satisfaction_solver.harden_upper_bound(&scaled,
+                                // bound).expect("Could not harden element");
                             }
                         }
                     }
@@ -1305,51 +1312,54 @@ impl Solver {
         );
 
         let lb_last_result = lb_res.last().expect("Expected lower bound");
-        let lb_len = lb_stat.get_result().len();
+        let lb_len = lb_res.len();
         let core_len = core_res.len();
+        // final value / #steps = average step
+        let lb_step_freq = lb_last_result.1 as f32 / lb_len as f32;
+        let lb_step_size = lb_last_result.0 as f32 / lb_len as f32;
 
         // Calculate optimal slope for linear approximation (using Gauss-Markov theorem)
         // for both core weight (= lb increase) and core size
         // https://doi.org/10.1016/0378-3758(91)90016-8
-        let lb_incs: Vec<i32> = lb_res
+        let lb_incs: Vec<f32> = lb_res
             .iter()
             .zip(lb_res.iter().skip(1))
-            .map(|(&(first_lb, _), &(second_lb, _))| *second_lb - *first_lb)
+            .map(|(&(first_lb, _), &(second_lb, _))| (second_lb - first_lb) as f32)
             .collect();
-        let lb_step_size = *lb_last_result.0 as f32 / lb_len as f32;
 
         // xs are the number of cores, ys are the lower bound increases
-        let (xy, x2): (Vec<i32>, Vec<i32>) = lb_incs
+        let (xy, x2): (Vec<f32>, Vec<f32>) = lb_incs
             .iter()
             .enumerate()
-            .map(|(a, &b)| (a as i32 * b, (a * a) as i32))
+            .map(|(a, &b)| (a as f32 * b, (a * a) as f32))
             .unzip();
-        let sum_x = ((lb_len * (lb_len + 1)) / 2) as i32;
-        let slope_lb = (lb_len as i32 * xy.iter().sum::<i32>()
-            - sum_x * lb_incs.iter().sum::<i32>()) as f64
-            / (lb_len as i32 * x2.iter().sum::<i32>() - sum_x * sum_x) as f64;
+        let sum_x = (lb_len as f32 * (lb_len + 1) as f32) / 2.0;
+        let slope_lb = (lb_len as f32 * xy.iter().sum::<f32>()
+            - sum_x * lb_incs.iter().sum::<f32>())
+            / (lb_len as f32 * x2.iter().sum::<f32>() - sum_x * sum_x);
 
         let core_size = core_res.iter().sum::<usize>() as f32 / core_len as f32;
         // xs are the number of cores, ys are the core sizes
-        let (xy, x2): (Vec<i32>, Vec<i32>) = core_res
-            .iter()
+        let sum_x = ((core_len * (core_len + 1)) / 2) as f32;
+        let sum_y = core_res.iter().map(|a| *a as f32).sum::<f32>();
+        let (xy, x2): (Vec<f32>, Vec<f32>) = core_res
+            .into_iter()
             .enumerate()
-            .map(|(a, &b)| ((a * b) as i32, (a * a) as i32))
+            .map(|(a, b)| ((a * b) as f32, (a * a) as f32))
             .unzip();
-        let sum_x = ((core_len * (core_len + 1)) / 2) as i32;
-        let sum_y = core_res.iter().map(|a| *a as i32).sum::<i32>();
-        let slope_core = (core_len as i32 * xy.iter().sum::<i32>() - sum_x * sum_y) as f64
-            / (core_len as i32 * x2.iter().sum::<i32>() - sum_x * sum_x) as f64;
+        let slope_core = (core_len as f32 * xy.iter().sum::<f32>() - sum_x * sum_y)
+            / (core_len as f32 * x2.iter().sum::<f32>() - sum_x * sum_x);
 
-        let time_solv = **task_res.get(&MonitoredTasks::Solving).unwrap_or(&&0);
-        let time_core = **task_res.get(&MonitoredTasks::CoreProcessing).unwrap_or(&&0);
-        let time_spec = **task_res.get(&MonitoredTasks::WCEAdditions).unwrap_or(&&0)
-            + **task_res.get(&MonitoredTasks::StrataCreation).unwrap_or(&&0);
+        let time_solv = *task_res.get(&MonitoredTasks::Solving).unwrap_or(&0);
+        let time_core = *task_res.get(&MonitoredTasks::CoreProcessing).unwrap_or(&0);
+        let time_spec = *task_res.get(&MonitoredTasks::WCEAdditions).unwrap_or(&0)
+            + *task_res.get(&MonitoredTasks::StrataCreation).unwrap_or(&0);
 
-        let core_per_reform = wce_res.iter().sum::<usize>() as f32 / wce_res.len() as f32;
+        let wce_len = wce_res.len() as f32;
+        let core_per_reform = wce_res.into_iter().map(|x| x as i32).sum::<i32>() as f32 / wce_len;
 
-        let unhard_fraction = hard_res.iter().product::<f32>();
-        let exh_fraction = exh_res.iter().product::<f32>();
+        let unhard_fraction = hard_res.into_iter().product::<f32>();
+        let exh_fraction = exh_res.into_iter().product::<f32>();
 
         println!(
             "This is summarised in the following data points:\n\
@@ -1367,7 +1377,7 @@ impl Solver {
             Total Relative Increase of Exhaustion: {:?}",
             lb_len,
             lb_step_size,
-            *lb_last_result.1 as f32 / lb_len as f32, // final value / #steps = average step
+            lb_step_freq,
             slope_lb,
             core_size,
             slope_core,

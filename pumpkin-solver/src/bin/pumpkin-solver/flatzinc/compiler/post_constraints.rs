@@ -790,10 +790,12 @@ fn process_objective_definition(
     let _ = variables.remove(obj_variable_idx);
     let _ = weights.remove(obj_variable_idx);
 
-    (weights
-        .iter()
-        .zip(variables.iter())
-        .map(|(&w, &v)| (w, v))
-        .collect(),
-     bias)
+    (
+        weights
+            .iter()
+            .zip(variables.iter())
+            .map(|(&w, &v)| (w, v))
+            .collect(),
+        bias,
+    )
 }

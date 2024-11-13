@@ -813,14 +813,22 @@ impl ConstraintSatisfactionSolver {
     }
 
     /// Get the upper bound for the given variable.
-    pub fn harden_upper_bound(&mut self, variable: &impl IntegerVariable, new_ub: i32) -> Result<(), EmptyDomain> {
-        //TODO add reason?
+    pub fn harden_upper_bound(
+        &mut self,
+        variable: &impl IntegerVariable,
+        new_ub: i32,
+    ) -> Result<(), EmptyDomain> {
+        // TODO add reason?
         variable.set_upper_bound(&mut self.assignments_integer, new_ub, None)
     }
 
     /// Get the upper bound for the given variable.
-    pub fn harden_lower_bound(&mut self, variable: &impl IntegerVariable, new_lb: i32) -> Result<(), EmptyDomain> {
-        //TODO add reason?
+    pub fn harden_lower_bound(
+        &mut self,
+        variable: &impl IntegerVariable,
+        new_lb: i32,
+    ) -> Result<(), EmptyDomain> {
+        // TODO add reason?
         variable.set_upper_bound(&mut self.assignments_integer, new_lb, None)
     }
 

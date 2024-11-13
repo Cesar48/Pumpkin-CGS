@@ -35,8 +35,14 @@ impl LowerBoundEvolutionMonitor {
 
     /// Combines the relevant data from this object into a single vector
     /// to remove the need for the object itself.
-    pub(crate) fn get_result(&self) -> Vec<(&i32, &u128)> {
-        self.lower_bounds.iter().zip(&self.timestamps).collect()
+    /// Note: consumes self.
+    pub(crate) fn get_result(self) -> Vec<(i32, u128)> {
+        let LowerBoundEvolutionMonitor {
+            lower_bounds,
+            timestamps,
+            ..
+        } = self;
+        lower_bounds.into_iter().zip(timestamps).collect()
     }
 }
 
@@ -57,8 +63,10 @@ impl CoreSizeMonitor {
     }
 
     /// Returns the list of core sizes, in order of discovery.
-    pub(crate) fn get_result(&self) -> Vec<usize> {
-        self.cores.clone()
+    /// Note: consumes self.
+    pub(crate) fn get_result(self) -> Vec<usize> {
+        let CoreSizeMonitor { cores } = self;
+        cores
     }
 }
 
@@ -140,8 +148,12 @@ impl TimePerTaskMonitor {
 
     /// Returns a [`HashMap`] of [`MonitoredTasks`]s and their total running time from the
     /// minimisation process.
-    pub(crate) fn get_result(&self) -> HashMap<&MonitoredTasks, &u128> {
-        self.tasks_with_times.iter().clone().collect()
+    /// Note: consumes self.
+    pub(crate) fn get_result(self) -> HashMap<MonitoredTasks, u128> {
+        let TimePerTaskMonitor {
+            tasks_with_times, ..
+        } = self;
+        tasks_with_times
     }
 }
 
@@ -165,8 +177,10 @@ impl WCECoreAmountMonitor {
 
     /// Returns the list containing the number of cores between two reformulation, for every
     /// interval between two reformulations.
-    pub(crate) fn get_result(&self) -> Vec<usize> {
-        self.num_cores.clone()
+    /// Note: consumes self.
+    pub(crate) fn get_result(self) -> Vec<usize> {
+        let WCECoreAmountMonitor { num_cores } = self;
+        num_cores
     }
 }
 
@@ -192,8 +206,10 @@ impl HardeningDomainLimitationMonitor {
     }
 
     /// Returns a [`Vec`] of the fractions of domains remaining after each hardening step.
-    pub(crate) fn get_result(&self) -> Vec<f32> {
-        self.domain_fractions.clone()
+    /// Note: consumes self.
+    pub(crate) fn get_result(self) -> Vec<f32> {
+        let HardeningDomainLimitationMonitor { domain_fractions } = self;
+        domain_fractions
     }
 }
 
@@ -221,7 +237,9 @@ impl CoreExhaustionMonitor {
     }
 
     /// Returns a [`Vec`] of the recorded values corresponding to each exhaustion.
-    pub(crate) fn get_result(&self) -> Vec<f32> {
-        self.bound_ratio.clone()
+    /// Note: consumes self
+    pub(crate) fn get_result(self) -> Vec<f32> {
+        let CoreExhaustionMonitor { bound_ratio } = self;
+        bound_ratio
     }
 }
