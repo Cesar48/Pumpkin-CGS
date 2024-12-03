@@ -105,6 +105,7 @@ pub(crate) fn solve(
                 *domain_id,
                 core_guided_options,
                 instance.objective_definition,
+                instance.partitioned_objective_data,
             ),
             FlatzincObjective::Minimize(domain_id) => solver.minimise(
                 &mut brancher,
@@ -112,6 +113,7 @@ pub(crate) fn solve(
                 *domain_id,
                 core_guided_options,
                 instance.objective_definition,
+                instance.partitioned_objective_data,
             ),
         };
 

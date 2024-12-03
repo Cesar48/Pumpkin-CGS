@@ -3,6 +3,7 @@ use std::fmt::Write;
 use std::rc::Rc;
 
 use pumpkin_solver::branching::branchers::dynamic_brancher::DynamicBrancher;
+use pumpkin_solver::options::PartitionedInstanceData;
 use pumpkin_solver::variables::DomainId;
 use pumpkin_solver::variables::Literal;
 
@@ -31,6 +32,7 @@ pub(crate) struct FlatZincInstance {
     pub(super) objective_function: Option<FlatzincObjective>,
     pub(super) search: Option<DynamicBrancher>,
     pub(super) objective_definition: Option<(Vec<(i32, DomainId)>, i32)>,
+    pub(super) partitioned_objective_data: Option<PartitionedInstanceData>,
 }
 
 impl FlatZincInstance {

@@ -6,6 +6,7 @@ mod define_constants;
 mod define_variable_arrays;
 mod handle_set_in;
 mod merge_equivalences;
+mod partitioner;
 mod post_constraints;
 mod prepare_variables;
 
@@ -35,11 +36,16 @@ pub(crate) fn compile(
         post_constraints::run(&ast, &mut context, options, &objective_function_with_name)?;
     let search = create_search_strategy::run(&ast, &mut context)?;
 
+    let partitioned = objective_definition.as_ref().and_then(|obj| {
+        partitioner::create_partitioned_instance_data(obj, &ast, &mut context).ok()
+    });
+
     let objective_function = objective_function_with_name.unzip().0;
     Ok(FlatZincInstance {
         outputs: context.outputs,
         objective_function,
         search: Some(search),
         objective_definition,
+        partitioned_objective_data: partitioned,
     })
 }

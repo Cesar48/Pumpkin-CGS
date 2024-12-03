@@ -80,6 +80,7 @@ pub mod options {
     pub use crate::propagators::CumulativeOptions;
     pub use crate::propagators::CumulativePropagationMethod;
     pub use crate::solver::CoreGuidedArgs;
+    pub use crate::solver::PartitionedInstanceData;
     #[cfg(doc)]
     use crate::Solver;
 }

@@ -4,6 +4,48 @@ use log::warn;
 
 use crate::basic_types::HashMap;
 
+pub(crate) struct MonitorGroup {
+    pub(crate) lb_stat: LowerBoundEvolutionMonitor,
+    pub(crate) core_stat: CoreSizeMonitor,
+    pub(crate) task_stat: TimePerTaskMonitor,
+    pub(crate) wce_stat: WCECoreAmountMonitor,
+    pub(crate) hard_stat: HardeningDomainLimitationMonitor,
+    pub(crate) exh_stat: CoreExhaustionMonitor,
+}
+
+impl MonitorGroup {
+    pub(crate) fn new() -> Self {
+        MonitorGroup {
+            lb_stat: LowerBoundEvolutionMonitor::new(),
+            core_stat: CoreSizeMonitor::new(),
+            task_stat: TimePerTaskMonitor::new(),
+            wce_stat: WCECoreAmountMonitor::new(),
+            hard_stat: HardeningDomainLimitationMonitor::new(),
+            exh_stat: CoreExhaustionMonitor::new(),
+        }
+    }
+
+    pub(crate) fn get_results(
+        self,
+    ) -> (
+        Vec<(i32, u128)>,
+        Vec<usize>,
+        HashMap<MonitoredTasks, u128>,
+        Vec<usize>,
+        Vec<f32>,
+        Vec<f32>,
+    ) {
+        (
+            self.lb_stat.get_result(),
+            self.core_stat.get_result(),
+            self.task_stat.get_result(),
+            self.wce_stat.get_result(),
+            self.hard_stat.get_result(),
+            self.exh_stat.get_result(),
+        )
+    }
+}
+
 /// A struct for measuring the evolution of lower bounds, by measuring both the lower bound and the
 /// time between two updated lower bounds.
 pub(crate) struct LowerBoundEvolutionMonitor {
@@ -78,6 +120,7 @@ pub(crate) enum MonitoredTasks {
     CoreProcessing,
     WCEAdditions,
     StrataCreation,
+    PartitionMerging,
 }
 
 /// A struct for keeping track of the time spent on every notable task.
