@@ -1441,7 +1441,12 @@ impl Solver {
             // Unit cores are handled separately, with relatively small differences between the
             // different approaches
             cost =
-                self.process_unit_core(core, assumptions, coefficient_elimination, weights_per_var);
+                self.process_unit_core(core,
+                                       assumptions,
+                                       variable_reformulation,
+                                       coefficient_elimination,
+                                       weights_per_var
+                );
             assum = None;
         } else {
             debug!("Core has a length of {}", core.len());
@@ -1481,6 +1486,7 @@ impl Solver {
         &mut self,
         core: &[Literal],
         assumptions: &mut Vec<Literal>,
+        variable_reformulation: bool,
         coefficient_elimination: bool,
         weights_per_var: &mut HashMap<u32, (i32, i32)>,
     ) -> i32 {
@@ -1521,6 +1527,7 @@ impl Solver {
             diff_in_bound,
             weights_per_var,
             !coefficient_elimination,
+            !variable_reformulation,
         )
     }
 
@@ -1742,7 +1749,7 @@ impl Solver {
         // of d_weight. As such, the total cost is: (lb_d - lb) * w_d
         // Also return the information needed for the new assumption d <= lb_d
         let lb_d = self.lower_bound(&d);
-        ((self.lower_bound(&d) - lb) * d_weight, (d, lb_d))
+        ((lb_d - lb) * d_weight, (d, lb_d))
     }
 
     /// For both reformulation techniques, the weight splitting procedure is quite similar. This
@@ -1821,6 +1828,7 @@ impl Solver {
                     self.lower_bound(did) - bound,
                     weights_per_var,
                     false,
+                    false,
                 )
             })
             .sum::<i32>();
@@ -1839,7 +1847,8 @@ impl Solver {
         did: DomainId,
         diff: i32,
         weights_per_var: &mut HashMap<u32, (i32, i32)>,
-        use_up_residual_weight: bool,
+        use_residual_weight: bool,
+        consume_residual_weight: bool,
     ) -> i32 {
         let mut cost = 0;
 
@@ -1847,11 +1856,9 @@ impl Solver {
         let (res_weight, orig_weight) = *weights_per_var
             .get(&did.id)
             .expect("Variable must have weights");
-        cost += diff * orig_weight;
-
-        if use_up_residual_weight && diff > 0 {
-            // NOTE: when using weight splitting, the first increase step uses the residual weight,
-            // not the full weight. Correct the cost for this single step.
+        if use_residual_weight && consume_residual_weight && diff > 0 {
+            // NOTE: when using slice-based weight splitting, the first increase step uses the
+            // residual weight, not the full weight. Correct the cost for this single step.
             cost += res_weight - orig_weight;
             // When "used up", reset the residual weight.
 
@@ -1859,7 +1866,11 @@ impl Solver {
             let _ = weights_per_var
                 .entry(did.id)
                 .and_modify(|(w_res, w_orig)| *w_res = *w_orig);
+        } else {
+            let w = if use_residual_weight {res_weight} else {orig_weight};
+            cost += diff * w;
         }
+
         cost
     }
 
