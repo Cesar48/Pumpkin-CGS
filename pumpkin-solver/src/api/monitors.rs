@@ -4,6 +4,48 @@ use log::warn;
 
 use crate::basic_types::HashMap;
 
+/// A grouping object for all different statistic monitors defined below. Allows easier
+/// instantiation and access when all or many are needed.
+pub(crate) struct StatisticsGroup {
+    pub lb: LowerBoundEvolutionMonitor,
+    pub cs: CoreSizeMonitor,
+    pub tpt: TimePerTaskMonitor,
+    pub wca: WCECoreAmountMonitor,
+    pub hdl: HardeningDomainLimitationMonitor,
+}
+
+impl StatisticsGroup {
+    /// Instantiate all submonitors.
+    pub(crate) fn new() -> Self {
+        StatisticsGroup {
+            lb: LowerBoundEvolutionMonitor::new(),
+            cs: CoreSizeMonitor::new(),
+            tpt: TimePerTaskMonitor::new(),
+            wca: WCECoreAmountMonitor::new(),
+            hdl: HardeningDomainLimitationMonitor::new(),
+        }
+    }
+
+    /// Retrieve and return the results of all submonitors.
+    pub(crate) fn get_results(
+        self,
+    ) -> (
+        Vec<(i32, u128)>,
+        Vec<usize>,
+        HashMap<MonitoredTasks, u128>,
+        Vec<usize>,
+        Vec<f32>,
+    ) {
+        (
+            self.lb.get_result(),
+            self.cs.get_result(),
+            self.tpt.get_result(),
+            self.wca.get_result(),
+            self.hdl.get_result(),
+        )
+    }
+}
+
 /// A struct for measuring the evolution of lower bounds, by measuring both the lower bound and the
 /// time between two updated lower bounds.
 pub(crate) struct LowerBoundEvolutionMonitor {
@@ -78,6 +120,7 @@ pub(crate) enum MonitoredTasks {
     CoreProcessing,
     WCEAdditions,
     StrataCreation,
+    Hardening,
 }
 
 /// A struct for keeping track of the time spent on every notable task.
@@ -210,36 +253,5 @@ impl HardeningDomainLimitationMonitor {
     pub(crate) fn get_result(self) -> Vec<f32> {
         let HardeningDomainLimitationMonitor { domain_fractions } = self;
         domain_fractions
-    }
-}
-
-/// A struct for keeping track of the relative lower bound increase achieved by core exhaustion.
-/// This metric is calculated by dividing the exhausted lower bound by the non-exhausted lower
-/// bound. Note that some very basic inference, which might increase the bound upon creation of the
-/// variable, is NOT counted in this metric, and thus actual core exhaustion needs to be performed
-/// for this metric to record different numbers from 1.
-pub(crate) struct CoreExhaustionMonitor {
-    bound_ratio: Vec<f32>,
-}
-
-impl CoreExhaustionMonitor {
-    /// Initialises a new [`CoreExhaustionMonitor`]
-    pub(crate) fn new() -> Self {
-        CoreExhaustionMonitor {
-            bound_ratio: vec![],
-        }
-    }
-
-    /// Called after exhaustion. Receives the quotient of the new bound and the old bound on the
-    /// newly introduced reformulation variable. This value is at least 1.
-    pub(crate) fn record_exhaustion(&mut self, quotient: f32) {
-        self.bound_ratio.push(quotient);
-    }
-
-    /// Returns a [`Vec`] of the recorded values corresponding to each exhaustion.
-    /// Note: consumes self
-    pub(crate) fn get_result(self) -> Vec<f32> {
-        let CoreExhaustionMonitor { bound_ratio } = self;
-        bound_ratio
     }
 }

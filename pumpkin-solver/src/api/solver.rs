@@ -1,5 +1,6 @@
 use std::num::NonZero;
 
+use itertools::Itertools;
 use log::debug;
 use log::info;
 use log::warn;
@@ -7,12 +8,9 @@ use log::warn;
 use super::results::OptimisationResult;
 use super::results::SatisfactionResult;
 use super::results::SatisfactionResultUnderAssumptions;
-use crate::api::monitors::CoreExhaustionMonitor;
-use crate::api::monitors::CoreSizeMonitor;
 use crate::api::monitors::HardeningDomainLimitationMonitor;
-use crate::api::monitors::LowerBoundEvolutionMonitor;
 use crate::api::monitors::MonitoredTasks;
-use crate::api::monitors::TimePerTaskMonitor;
+use crate::api::monitors::StatisticsGroup;
 use crate::api::monitors::WCECoreAmountMonitor;
 use crate::basic_types::CSPSolverExecutionFlag;
 use crate::basic_types::ConstraintOperationError;
@@ -485,7 +483,7 @@ impl Solver {
                     x,
                     true_objective,
                     bias,
-                    objective_variable,
+                    objective_variable.into(),
                     false,
                 )
             }
@@ -510,7 +508,7 @@ impl Solver {
         match core_guided_options {
             Some(x) => {
                 let (true_objective, bias) = match objective_definition {
-                    Some(y) => (y.0.into_iter().map(|(w, v)| (-w, v)).collect(), y.1),
+                    Some(y) => (y.0.into_iter().map(|(w, v)| (-w, v)).collect(), -y.1),
                     None => (vec![(-1_i32, objective_variable)], 0),
                 };
                 self.minimise_internal_cgs(
@@ -519,7 +517,7 @@ impl Solver {
                     x,
                     true_objective,
                     bias,
-                    objective_variable,
+                    objective_variable.scaled(-1),
                     true,
                 )
             }
@@ -843,6 +841,11 @@ pub(crate) struct DecomposedPredicate {
     bound: i32,
 }
 
+/// In stratification and WCE, variables are passed around with (potentially outdated) lower bounds.
+/// These bounds are vital in calculating additional cost etc., and must be associated with the
+/// variables at all times. This type ensures that these values stay associated with one another.
+type VarWithBound = (AffineView<DomainId>, i32);
+
 /// In core-guided search, stratification can be used to find intermediate (increasingly good)
 /// solutions. When used, stratification needs to divide the objective function into strata,
 /// the steps of which are conveniently bundled into this object. It can be used as a
@@ -850,27 +853,26 @@ pub(crate) struct DecomposedPredicate {
 /// strata can be extracted at once by calling [`StratificationPartitioner::all_strata`].
 pub(crate) struct StratificationPartitioner {
     weights: Vec<i32>,
-    vars: Vec<AffineView<DomainId>>,
-    lower_bounds: Vec<i32>,
+    vars_bounds: Vec<VarWithBound>,
 }
 
-type VarWithBound = (AffineView<DomainId>, i32);
-type VarsWithSeparatedBounds = (Vec<AffineView<DomainId>>, Vec<i32>);
 impl StratificationPartitioner {
+    /// Initializes the [`StratificationPartitioner`] by sorting and unzipping the provided input;
+    /// a list of weights and variables with lower bounds. These lists are sorted by increasing
+    /// value of the weights, such that strata can be easily created by iterating over  these lists
+    /// from end until a different weight is encountered. Note that all weights must be positive,
+    /// and variables and lower bounds must have the right polarity.
     pub(crate) fn new(
         objective_function: impl Iterator<Item = (i32, VarWithBound)>,
     ) -> StratificationPartitioner {
-        // Clone the input and sort by weights.
+        // Collect the input, and sort it by the provided weights (increasing, so [`Vec::pop`]
+        // returns the element with the highest weight).
         let mut tmp = objective_function.collect::<Vec<_>>();
-        // Sort increasing, this way [`Vec::pop`] returns the highest-weighing variable.
         tmp.sort_by(|a, b| a.0.cmp(&b.0));
-        // Split into components
-        let (weights, (vars, lower_bounds)): (Vec<i32>, VarsWithSeparatedBounds) =
-            tmp.into_iter().unzip();
+        let (weights, vars_bounds): (Vec<i32>, Vec<VarWithBound>) = tmp.into_iter().unzip();
         StratificationPartitioner {
             weights,
-            vars,
-            lower_bounds,
+            vars_bounds,
         }
     }
 
@@ -879,34 +881,29 @@ impl StratificationPartitioner {
     /// the original lower bound; this to calculate any incurred cost. Furthermore, an i32
     /// is returned which represents the weight of all these elements.
     pub(crate) fn next_stratum(&mut self) -> (Vec<VarWithBound>, i32) {
-        assert_eq!(self.weights.len(), self.vars.len());
-        assert_eq!(self.lower_bounds.len(), self.vars.len());
-        if self.weights.is_empty() {
+        let l = self.weights.len();
+        assert_eq!(l, self.vars_bounds.len());
+        if l == 0 {
             (vec![], 0)
         } else {
             let mut res = vec![];
             // Take the first weight; this is the weight of this stratum.
             let w = self.weights.pop().unwrap();
-            // Take corresponding variable and lower bound as well.
-            res.push((self.vars.pop().unwrap(), self.lower_bounds.pop().unwrap()));
 
+            res.push(self.vars_bounds.pop().unwrap());
             loop {
                 match self.weights.pop() {
-                    // While the weight is the same, we're still in this stratum.
-                    Some(v) if v == w => {
-                        res.push((self.vars.pop().unwrap(), self.lower_bounds.pop().unwrap()))
-                    }
-                    // If the weight changes, re-add the weight, and stop collecting. The stratum
-                    // is exhausted.
-                    Some(x) => {
-                        self.weights.push(x);
+                    // While the weight is the same, we're still in the same stratum.
+                    Some(v) if v == w => res.push(self.vars_bounds.pop().unwrap()),
+                    // If the weight changes, the stratum is exhausted. Re-add the weight, and stop.
+                    Some(v) => {
+                        self.weights.push(v);
                         break;
                     }
                     // If the list is exhausted, the stratum is as well.
                     None => break,
                 }
             }
-
             (res, w)
         }
     }
@@ -923,7 +920,6 @@ impl StratificationPartitioner {
                 false => res.insert(0, strat),
             }
         }
-
         res
     }
 }
@@ -954,7 +950,6 @@ impl Solver {
     /// used when solving.
     fn remove_core_from_assumptions(core: &[Literal], assumptions: &mut Vec<Literal>) {
         let core_set: HashSet<&Literal> = HashSet::from_iter((*core).iter());
-        // Remove assumptions occurring in core.
         assumptions.retain(|a| !core_set.contains(a));
     }
 
@@ -968,78 +963,86 @@ impl Solver {
         core_guided_options: CoreGuidedArgs,
         objective_function: Vec<(i32, DomainId)>,
         bias: i32,
-        objective_variable: DomainId,
+        obj_var: AffineView<DomainId>,
         _is_maximising: bool,
     ) -> OptimisationResult {
-        let mut lb_stat = LowerBoundEvolutionMonitor::new();
-        let mut core_stat = CoreSizeMonitor::new();
-        let mut task_stat = TimePerTaskMonitor::new();
-        let mut wce_stat = WCECoreAmountMonitor::new();
-        let mut hard_stat = HardeningDomainLimitationMonitor::new();
-        let mut exh_stat = CoreExhaustionMonitor::new();
+        let mut stat = StatisticsGroup::new();
 
-        task_stat.start_task(MonitoredTasks::Overhead);
+        stat.tpt.start_task(MonitoredTasks::Overhead);
         debug!(
             "Start of CGS minimisation, with following options: {:?}",
             core_guided_options
         );
-        let mut unadded_parts_of_objective_function;
-        if core_guided_options.stratification {
-            task_stat.start_task(MonitoredTasks::StrataCreation);
-            unadded_parts_of_objective_function = StratificationPartitioner::new(
-                // Add lower bounds and pass to function.
-                objective_function
-                    .iter()
-                    .map(|(w, did)| (w, did.scaled(w.signum())))
-                    .map(|(w, did)| {
-                        let lb = self.lower_bound(&did);
-                        (*w, (did, lb))
-                    }),
-            )
-            .all_strata(); // Extract relevant data
-            task_stat.end_task(MonitoredTasks::StrataCreation);
+        debug!(
+            "Objective function is as follows: {} + {}",
+            objective_function
+                .iter()
+                .map(|(w, var)| format!("{}*{}", w, var))
+                .join(" + "),
+            -bias
+        );
+
+        let mut unadded_parts_of_objective_function = if core_guided_options.stratification {
+            // If stratification is active, calculate the strata and store them in a vector.
+            // The vector allows the length to be checked (alongside whether it is empty).
+            // Note: the strata need the lower bound (with correct polarity), and (absolute) weight.
+            stat.tpt.start_task(MonitoredTasks::StrataCreation);
+            let strata =
+                StratificationPartitioner::new(objective_function.iter().map(|(w, did)| {
+                    let scaled = did.scaled(w.signum());
+                    let lb = self.lower_bound(&scaled);
+                    (w.abs(), (scaled, lb))
+                }))
+                .all_strata();
+
             debug!(
-                "Stratification active, number of strata: {}",
-                unadded_parts_of_objective_function.len(),
+                "Stratification active, {} strata: {:?}",
+                strata.len(),
+                strata
+                    .iter()
+                    .map(|(v, w)| (*w, v.len()))
+                    .collect::<Vec<(i32, usize)>>(),
             );
+            stat.tpt.end_task(MonitoredTasks::StrataCreation);
+            strata
         } else {
-            unadded_parts_of_objective_function = vec![(
+            // If stratification is inactive, create a single stratum with all objective variables
+            vec![(
                 objective_function
                     .iter()
-                    .cloned()
-                    .map(|(w, did)| did.scaled(w.signum()))
-                    .map(|did| {
-                        let lb = self.lower_bound(&did);
-                        (did, lb)
+                    .map(|(w, did)| {
+                        let scaled = did.scaled(w.signum());
+                        let lb = self.lower_bound(&scaled);
+                        (scaled, lb)
                     })
                     .collect(),
                 0,
             )]
-        }
+        };
 
-        // Add assumptions which fix all objective variables to their lower bounds;
-        // create literals for these conditions.
+        // Add assumptions which fix all objective variables to their lower bounds. Note that these
+        // are the initial lower bounds, and thus no additional cost is incurred.
         let (initial_stratum, _) = unadded_parts_of_objective_function
             .pop()
             .expect("Expected at least 1 objective function term");
+        debug!("Initial stratum has length {}", initial_stratum.len());
         let (mut assumptions, _) = self.create_assumptions_with_lb_diff(initial_stratum);
 
-        let mut solution: Option<Solution> = None;
         // This boolean signals whether the result of the solver is 'final'; if a solution is found
         // with no information left to be added, or if unconditional unsatisfiability is found.
         let mut proven = false;
-        let signed_objective = objective_variable.scaled(match _is_maximising {
-            true => -1,
-            false => 1,
-        });
+        let mut solution: Option<Solution> = None;
+
         // Keep track of the lower bound on the objective, as governed by the assumptions.
-        // Note: this is `bias` off from the actual lower bound (as proven)
+        // Note: this is `bias` above the actual (proven) lower bound.
         let mut current_lower_bound = objective_function
             .iter()
             .map(|(w, did)| self.lower_bound(&did.scaled(*w)))
             .sum::<i32>();
         debug!("Initializing lower bound as {}", current_lower_bound);
 
+        // Save the residual resp. original weights of each variable. Note that residual is only
+        // used in weight splitting, and original is not used in variable-based weight splitting.
         let mut weights_per_var: HashMap<u32, (i32, i32)> = HashMap::from(
             objective_function
                 .iter()
@@ -1047,25 +1050,27 @@ impl Solver {
                 .collect(),
         );
 
-        // In the case of weight-aware core extraction (WCE), we fully process a core but don't yet
-        // add the new assumptions. Keep track of the assumptions to be added.
-        // Note: all reformulation variables have weight >=0
+        // Assumptions delayed through WCE. Note: all reformulation variables have weight >=0.
         let mut delayed_assumptions: Vec<(DomainId, i32)> = vec![];
 
+        stat.lb.update(current_lower_bound);
         // Repeat until satisfiable
         loop {
-            let (actual_lb, actual_ub) = (
-                self.lower_bound(&signed_objective),
-                self.upper_bound(&signed_objective),
+            let (actual_lb, actual_ub) = (self.lower_bound(&obj_var), self.upper_bound(&obj_var));
+            debug!(
+                "Bounds are currently: {} (est. lb), {} (act. lb), {} (ub)",
+                current_lower_bound - bias,
+                actual_lb,
+                actual_ub
             );
-
-            // Update lower bound every iteration
-            lb_stat.update(current_lower_bound);
 
             if current_lower_bound - bias > actual_ub
                 || actual_lb > actual_ub
                 || assumptions.contains(&Literal::u32_to_literal(0))
             {
+                // If the current estimated lower bound or the actual lower bound exceeds the
+                // actual upper bound, or if one of the assumptions implies false, we have proven
+                // unsatisfiability.
                 info!("Stopping solving process due to violated bounds");
                 debug!(
                     "est. lb > ub: {}; act. lb > ub: {}; assume false: {}",
@@ -1073,337 +1078,180 @@ impl Solver {
                     actual_lb > actual_ub,
                     assumptions.contains(&Literal::u32_to_literal(0)),
                 );
-                proven = solution.is_none();
-                if !proven {
-                    warn!(
-                        "A solution has been found before UNSAT; closer inspection \
-                        required. Note: hardening was {}",
-                        core_guided_options.harden,
-                    );
+
+                // If the bounds are violated, this means that all values in the domain of the
+                // objective value are proven infeasible, i.e. the problem is unsatisfiable.
+                proven = true;
+                if !solution.is_none() {
+                    // If all values are proven infeasible, but one was found, something's wrong.
+                    proven = false;
+                    warn!("Solution found before UNSAT; closer inspection required.");
                 }
                 break;
             }
 
-            let core = {
-                task_stat.start_task(MonitoredTasks::Solving);
+            let (core, harden_info) = {
+                // Check satisfiability under current assumptions.
+                stat.tpt.start_task(MonitoredTasks::Solving);
                 let solv_res = self.satisfy_under_assumptions(brancher, termination, &assumptions);
-                task_stat.end_task(MonitoredTasks::Solving);
+                stat.tpt.end_task(MonitoredTasks::Solving);
 
                 match solv_res {
+                    // If a solution is found, check if it's better than the previous solution
+                    // (if any), save the best of the two and report absence of a core.
                     SatisfactionResultUnderAssumptions::Satisfiable(sol) => {
-                        debug!("New solution found");
-                        // Extract solution.
-                        solution = match solution {
-                            Some(old_sol)
-                                if old_sol.lower_bound(&signed_objective)
-                                    < sol.lower_bound(&signed_objective) =>
-                            {
-                                // If the old solution is better than the new one, don't replace.
-                                // Note: minimisation, so better means that (old_obj < new_obj)
+                        let new_val = sol.lower_bound(&obj_var);
+                        debug!("New solution found with objective value {}", new_val);
+                        let (best_solution, harden_val) = match solution {
+                            // Note: minimisation, so "better" means that `old_obj < new_obj`.
+                            Some(old_sol) if old_sol.lower_bound(&obj_var) <= new_val => {
                                 debug!("Keeping old solution");
-                                Some(old_sol)
+                                (old_sol, None)
                             }
                             _ => {
                                 debug!("Using new solution as best so far");
-                                Some(sol)
+                                (sol, Some(new_val))
                             }
                         };
-
-                        if delayed_assumptions.is_empty()
-                            && unadded_parts_of_objective_function.is_empty()
-                        {
-                            info!("Newly found solution is proven to be optimal; exiting...");
-                            // If no information is held back, this is the final solution, and thus
-                            // optimal. The cores are the proof of this. In other words, the
-                            // current solution is proven to be optimal.
-                            proven = true;
-                            break;
-                        } else {
-                            debug!("Information remaining; preparing to add info");
-                            None
-                        }
+                        solution = Some(best_solution);
+                        (None, harden_val) // No core present.
                     }
+                    // Stop optimisation if Unknown is returned (presumably due to timeout).
                     SatisfactionResultUnderAssumptions::Unknown => {
                         info!("Result Unknown returned; presumably timeout");
                         break;
                     }
+                    // If the solver reports (unconditional) unsatisfiability, we have proven that
+                    // the base problem is unsatisfiable. Report this.
                     SatisfactionResultUnderAssumptions::Unsatisfiable => {
-                        // If the solver reports (unconditional) unsatisfiability, this must mean
-                        // the base problem is unsatisfiable. If this is
-                        // indeed the case (and a previous solution does not
-                        // exist), we have proven usatisfiability.
                         info!("UNSAT proven; exiting...");
-                        proven = solution.is_none();
-                        if !proven {
-                            warn!(
-                                "A solution has been found before UNSAT; closer inspection \
-                                required. Note: hardening was {}",
-                                core_guided_options.harden,
-                            );
+                        proven = true;
+                        if !solution.is_none() {
+                            // If the unsatisfiability is unconditional, solution should be None.
+                            proven = false;
+                            warn!("Solution found before UNSAT; closer inspection required.");
                         }
                         break;
                     }
+                    // If assumptions cause unsatisfiability, extract the UNSAT core.
                     SatisfactionResultUnderAssumptions::UnsatisfiableUnderAssumptions(
                         mut core_extractor,
                     ) => {
                         debug!("Core found");
-                        // If a core is encountered, we process the core and continue solving.
-                        Some(core_extractor.extract_core())
+                        (Some(core_extractor.extract_core()), None)
                     }
                 }
             };
 
             if let Some(c) = core {
+                stat.tpt.start_task(MonitoredTasks::CoreProcessing);
                 info!("Processing core of size {}", c.len());
-                core_stat.core_found(c.len());
+                stat.cs.core_found(c.len());
 
-                task_stat.start_task(MonitoredTasks::CoreProcessing);
-                let (add_cost, add_assum) = self.process_core(
+                let (add_cost, new_assum) = self.process_core(
                     &c,
                     &mut assumptions,
                     core_guided_options.variable_reformulation,
                     core_guided_options.coefficient_elimination,
                     &mut weights_per_var,
                 );
-                task_stat.end_task(MonitoredTasks::CoreProcessing);
+                stat.tpt.end_task(MonitoredTasks::CoreProcessing);
 
+                // Update lower bound after every core-processing iteration
                 current_lower_bound += add_cost;
+                stat.lb.update(current_lower_bound);
 
-                if let Some(assum) = add_assum {
-                    debug!("Assumption was returned: {:?}", assum);
-                    let (did, lb) = assum;
-                    // TODO perform core exhaustion
-                    let new_lb = lb;
-                    exh_stat.record_exhaustion(new_lb as f32 / lb as f32);
+                // If a new assumption is present, add it in the appropriate place.
+                if let Some((did, lb)) = new_assum {
+                    debug!("Assumption was returned: {:?}", (did, lb));
                     if core_guided_options.weight_aware_cores {
-                        delayed_assumptions.push((did, new_lb));
+                        delayed_assumptions.push((did, lb));
                     } else {
-                        debug!("Added to assumptions");
-                        assumptions.push(self.get_literal(predicate!(did <= new_lb)));
+                        assumptions.push(self.get_literal(predicate!(did <= lb)));
                     }
                 }
             } else if let Some(sol) = solution {
-                // There was a solution found; since no `break` has been encountered, there is
-                // information which was held back. Add this information where needed.
-
-                // WCE: check if previously extracted cores still need to be added.
-                if !delayed_assumptions.is_empty() {
-                    debug!("Adding delayed assumptions: {}", delayed_assumptions.len());
-
-                    task_stat.start_task(MonitoredTasks::WCEAdditions);
-                    wce_stat.record_reformulation(delayed_assumptions.len());
-                    let (additional_assum, additional_cost) =
-                        self.process_wce(&mut delayed_assumptions, &mut weights_per_var);
-                    assumptions.extend(additional_assum);
-                    debug!(
-                        "LB's of delayed assumptions incurred additional cost: {}",
-                        additional_cost,
-                    );
-                    current_lower_bound += additional_cost;
-                    task_stat.end_task(MonitoredTasks::WCEAdditions);
+                // If a solution was found, check if any information was held back. If so, add this
+                // information; if not, report optimality.
+                let (wce_empty, strat_empty) = (
+                    delayed_assumptions.is_empty(),
+                    unadded_parts_of_objective_function.is_empty(),
+                );
+                if wce_empty && strat_empty {
+                    info!("No remaining information, solution is proven to be optimal. Exiting...");
+                    proven = true;
+                    solution = Some(sol); // Restore ownership
+                    break;
                 }
 
-                // Stratification: check if strata still need to be added.
-                if !unadded_parts_of_objective_function.is_empty() {
-                    debug!(
-                        "{} strata remaining",
-                        unadded_parts_of_objective_function.len()
+                // WCE: add any previously created reformulation variables.
+                if !wce_empty {
+                    stat.tpt.start_task(MonitoredTasks::WCEAdditions);
+                    let (new_assum, cost) = self.process_wce(
+                        &mut delayed_assumptions,
+                        &mut weights_per_var,
+                        &mut stat.wca,
+                        core_guided_options.coefficient_elimination,
+                        core_guided_options.variable_reformulation,
                     );
-                    // Unpack stratum.
-                    task_stat.start_task(MonitoredTasks::StrataCreation);
-                    let (stratum, weight) = unadded_parts_of_objective_function.pop().unwrap();
-                    debug!("Adding stratum of length {} (w: {})", stratum.len(), weight);
-                    // Make assumptions from stratum, and calculate lower bound difference.
-                    let (new_assum, diff) = self.create_assumptions_with_lb_diff(stratum);
                     assumptions.extend(new_assum);
-
-                    let cost = weight * diff.iter().sum::<i32>();
-                    if cost > 0 {
-                        debug!("LB's of stratum incurred additional cost: {}", cost);
-                    }
                     current_lower_bound += cost;
-                    task_stat.end_task(MonitoredTasks::StrataCreation);
+                    stat.tpt.end_task(MonitoredTasks::WCEAdditions);
                 }
-
-                // Hardening: add the upper bounds explicitly.
-                if core_guided_options.harden {
-                    let mapped_obj_val = sol.lower_bound(&signed_objective);
-                    let ub = self.upper_bound(&signed_objective);
-                    if mapped_obj_val < self.upper_bound(&signed_objective) {
+                // Stratification: check if strata still need to be added.
+                if !strat_empty {
+                    stat.tpt.start_task(MonitoredTasks::StrataCreation);
+                    let (new_assum, cost) =
+                        self.process_stratum(&mut unadded_parts_of_objective_function);
+                    assumptions.extend(new_assum);
+                    current_lower_bound += cost;
+                    stat.tpt.end_task(MonitoredTasks::StrataCreation);
+                }
+                // Hardening: add upper bounds explicitly if the objective value improved.
+                if let Some(hi) = harden_info {
+                    let ub = self.upper_bound(&obj_var);
+                    if core_guided_options.harden && hi <= ub {
+                        stat.tpt.start_task(MonitoredTasks::Hardening);
+                        // Check if the objective value is better than our current upper bound
                         debug!(
                             "Hardening obj to [{}, {}] (was {})",
-                            self.lower_bound(&signed_objective),
-                            mapped_obj_val,
+                            self.lower_bound(&obj_var),
+                            hi,
                             ub
                         );
-
-                        // Harden the full objective; useful for inference.
-                        // self.satisfaction_solver.harden_upper_bound(&signed_objective,
-                        // mapped_obj_val).expect("Could not harden");
-                        self.add_clause(vec![
-                            self.get_literal(predicate!(signed_objective <= mapped_obj_val))
-                        ])
-                        .expect("Could not harden");
-
-                        // Calculate the domain gap and use this to calculate the new domain sizes
-                        // of each variable (for statistics, as well as through constraints)
-                        // Note: we CANNOT use the lower bound estimate for this, as  WCE or
-                        // stratification might cause it to be too low.
-                        // Note: it is also much harder to harden reformulation variables, as their
-                        // lower bounds may not be reflected in the inferred_lb.
-                        let inferred_lb = objective_function
-                            .iter()
-                            .map(|(w, did)| self.lower_bound(&did.scaled(*w)))
-                            .sum::<i32>()
-                            - bias;
-                        let gap = mapped_obj_val - inferred_lb;
-                        debug!("Gap is {} - {} = {}", mapped_obj_val, inferred_lb, gap);
-                        let fraction: f32 = objective_function
-                            .iter()
-                            .map(|(w, did)| {
-                                (self.upper_bound(did) - self.lower_bound(did) + 1) as f32
-                                    / (gap / w.abs() + 1) as f32
-                            })
-                            .filter(|frac| *frac < 1.0)
-                            .product();
-                        hard_stat.hardened(fraction);
-                        // Add aforementioned constraints.
-                        for (w, did) in &objective_function {
-                            let scaled = did.scaled(*w);
-                            // Any variable can in theory increase obj by ub_{scaled} - lb_{scaled}.
-                            // In other words, if obj can increase at most X, we know that
-                            // ub_{scaled} - lb_{scaled} \leq X --> ub_{scaled} \leq lb_{scaled} + X
-                            let (lb, ub) = (self.lower_bound(&scaled), self.upper_bound(&scaled));
-                            let bound = lb + gap;
-                            if ub > bound {
-                                debug!("Hardening {} to [{}, {}] (was {})", did, lb, bound, ub);
-                                self.add_clause(
-                                    vec![self.get_literal(predicate!(scaled <= bound))],
-                                )
-                                .expect("Could not harden");
-                                // self.satisfaction_solver.harden_upper_bound(&scaled,
-                                // bound).expect("Could not harden element");
-                            }
-                        }
+                        self.process_hardening(
+                            hi,
+                            &obj_var,
+                            &objective_function,
+                            &bias,
+                            &weights_per_var,
+                            &mut stat.hdl,
+                        );
+                        stat.tpt.end_task(MonitoredTasks::Hardening);
                     }
                 }
                 solution = Some(sol);
+            } else {
+                warn!(
+                    "Unreachable state reached: solver terminated in continuation configuration, \
+                but no core or solution was present."
+                )
             }
         }
 
         debug!("Exited loop, returning answer...");
-        task_stat.end_task(MonitoredTasks::Overhead);
+        stat.tpt.end_task(MonitoredTasks::Overhead);
 
-        let lb_res = lb_stat.get_result();
-        let core_res = core_stat.get_result();
-        let task_res = task_stat.get_result();
-        let wce_res = wce_stat.get_result();
-        let hard_res = hard_stat.get_result();
-        let exh_res = exh_stat.get_result();
-        println!(
-            "The following custom statistics were collected:\n\
-            Lower Bounds: {:?}\n\
-            Core Size: {:?}\n\
-            Time per Task: {:?}\n\
-            Number of Disjoint Cores between Reformulations: {:?}\n\
-            Remaining Domain Fractions after Hardening: {:?}\n\
-            Relative Increase in Lower Bound after Exhaustion: {:?}",
-            lb_res, core_res, task_res, wce_res, hard_res, exh_res,
+        self.print_statistics(
+            stat,
+            if let Some(s) = &solution {
+                // Restore objective value to original sign.
+                (s.lower_bound(&obj_var) * if _is_maximising { -1 } else { 1 }) as f32
+            } else {
+                f32::NAN
+            },
+            proven,
         );
-
-        let lb_last_result = lb_res.last().expect("Expected lower bound");
-        let lb_len = lb_res.len();
-        let core_len = core_res.len();
-        // final value / #steps = average step
-        let lb_step_freq = lb_last_result.1 as f32 / lb_len as f32;
-        let lb_step_size = lb_last_result.0 as f32 / lb_len as f32;
-
-        // Calculate optimal slope for linear approximation (using Gauss-Markov theorem)
-        // for both core weight (= lb increase) and core size
-        // https://doi.org/10.1016/0378-3758(91)90016-8
-        let lb_incs: Vec<f32> = lb_res
-            .iter()
-            .zip(lb_res.iter().skip(1))
-            .map(|(&(first_lb, _), &(second_lb, _))| (second_lb - first_lb) as f32)
-            .collect();
-
-        // xs are the number of cores, ys are the lower bound increases
-        let (xy, x2): (Vec<f32>, Vec<f32>) = lb_incs
-            .iter()
-            .enumerate()
-            .map(|(a, &b)| (a as f32 * b, (a * a) as f32))
-            .unzip();
-        let sum_x = (lb_len as f32 * (lb_len + 1) as f32) / 2.0;
-        let slope_lb = (lb_len as f32 * xy.iter().sum::<f32>()
-            - sum_x * lb_incs.iter().sum::<f32>())
-            / (lb_len as f32 * x2.iter().sum::<f32>() - sum_x * sum_x);
-
-        let core_size = core_res.iter().sum::<usize>() as f32 / core_len as f32;
-        // xs are the number of cores, ys are the core sizes
-        let sum_x = ((core_len * (core_len + 1)) / 2) as f32;
-        let sum_y = core_res.iter().map(|a| *a as f32).sum::<f32>();
-        let (xy, x2): (Vec<f32>, Vec<f32>) = core_res
-            .into_iter()
-            .enumerate()
-            .map(|(a, b)| ((a * b) as f32, (a * a) as f32))
-            .unzip();
-        let slope_core = (core_len as f32 * xy.iter().sum::<f32>() - sum_x * sum_y)
-            / (core_len as f32 * x2.iter().sum::<f32>() - sum_x * sum_x);
-
-        let time_solv = *task_res.get(&MonitoredTasks::Solving).unwrap_or(&0);
-        let time_core = *task_res.get(&MonitoredTasks::CoreProcessing).unwrap_or(&0);
-        let time_spec = *task_res.get(&MonitoredTasks::WCEAdditions).unwrap_or(&0)
-            + *task_res.get(&MonitoredTasks::StrataCreation).unwrap_or(&0);
-
-        let wce_len = wce_res.len() as f32;
-        let core_per_reform = wce_res.into_iter().map(|x| x as i32).sum::<i32>() as f32 / wce_len;
-
-        let unhard_fraction = hard_res.into_iter().product::<f32>();
-        let exh_fraction = exh_res.into_iter().product::<f32>();
-
-        println!(
-            "This is summarised in the following data points:\n\
-            Lower Bound Steps: {:?}\n\
-            Lower Bound Step Size: {:?}\n\
-            Lower Bound Update Frequency: {:?}\n\
-            Lower Bound Slope: {:?}\n\
-            Average Core Size: {:?}\n\
-            Core Size Slope: {:?}\n\
-            Time Spent in Solver: {:?}\n\
-            Time Spent Processing Cores: {:?}\n\
-            Time Spent on Special Operations: {:?}\n\
-            Average Number of Reformulation Cores: {:?}\n\
-            Total Unhardened Fraction: {:?}\n\
-            Total Relative Increase of Exhaustion: {:?}",
-            lb_len,
-            lb_step_size,
-            lb_step_freq,
-            slope_lb,
-            core_size,
-            slope_core,
-            time_solv,
-            time_core,
-            time_spec,
-            core_per_reform,
-            unhard_fraction,
-            exh_fraction,
-        );
-
-        let obj = if let Some(s) = &solution {
-            s.lower_bound(&objective_variable) as f32
-        } else {
-            f32::NAN
-        };
-        let is_optimal = proven && (!obj.is_nan());
-        let obj_of_optimal = if is_optimal { obj } else { f32::NAN };
-
-        let total_time = time_solv + time_core + time_spec;
-        let nnodes = self.satisfaction_solver.get_number_of_decisions();
-
-        println!("-=- CSV version -=-");
-        println!("lb_nstep;lb_size;lb_slope;core_size;core_slope;time_solv;time_core;time_special;ncore_reform;unhard_frac;exh_frac;obj;is_optimal;optimal_found_value;nnodes;total_time");
-        println!("{lb_len};{lb_step_size};{slope_lb};{core_size};{slope_core};{time_solv};{time_core};{time_spec};{core_per_reform};{unhard_fraction};{exh_fraction};{obj};{is_optimal};{obj_of_optimal};{nnodes};{total_time}");
-        println!("-=- End of CSV -=-");
 
         match (solution, proven) {
             // If a solution has been found, and was proven to be optimal, return it as the
@@ -1421,6 +1269,112 @@ impl Solver {
         }
     }
 
+    /// After the optimisation process, many statistics have been collected. This function accepts
+    /// those statistics as arguments and prints all relevant (raw and aggregated) data.
+    fn print_statistics(&mut self, stat: StatisticsGroup, obj: f32, proven: bool) {
+        let (lb_res, core_res, task_res, wce_res, hard_res) = stat.get_results();
+        let (lb_vals, lb_times): (Vec<i32>, Vec<u128>) = lb_res.into_iter().unzip();
+
+        println!(
+            "The following custom statistics were collected:\n\
+            Lower Bound Valuess: {:?}\n\
+            Lower Bound Times: {:?}\n\
+            Core Size: {:?}\n\
+            Time per Task: {:?}\n\
+            Number of Disjoint Cores between Reformulations: {:?}\n\
+            Remaining Domain Fractions after Hardening: {:?}",
+            lb_vals, lb_times, core_res, task_res, wce_res, hard_res,
+        );
+
+        let core_len = core_res.len();
+        // (final diff) / #steps = average diff
+        let lb_len = lb_vals.len();
+        let lb_step_freq = *lb_times.last().expect("Expected lower bound") as f32 / lb_len as f32;
+        let lb_step_size =
+            (*lb_vals.last().unwrap() - *lb_vals.first().unwrap()) as f32 / lb_len as f32;
+
+        // Calculate optimal slope for linear approximation.
+        let lb_incs: Vec<f32> = lb_vals
+            .iter()
+            .zip(lb_vals.iter().skip(1))
+            .map(|(&first_lb, &second_lb)| (second_lb - first_lb) as f32)
+            .collect();
+
+        // xs are the number of cores, ys are the lower bound increases
+        let (xy, x2): (Vec<f32>, Vec<f32>) = lb_incs
+            .iter()
+            .enumerate()
+            .map(|(a, &b)| (a as f32 * b, (a * a) as f32))
+            .unzip();
+
+        let lb_inc_len = lb_len - 1;
+
+        let sum_x = (lb_inc_len * (lb_inc_len - 1) / 2) as f32;
+        let slope_lb = (lb_inc_len as f32 * xy.iter().sum::<f32>()
+            - sum_x * lb_incs.iter().sum::<f32>())
+            / (lb_inc_len as f32 * x2.iter().sum::<f32>() - sum_x * sum_x);
+
+        let core_size = core_res.iter().sum::<usize>() as f32 / core_len as f32;
+        // xs are the number of cores, ys are the core sizes
+        let sum_x = (core_len * (core_len - 1) / 2) as f32;
+        let sum_y = core_res.iter().map(|a| *a as f32).sum::<f32>();
+        let (xy, x2): (Vec<f32>, Vec<f32>) = core_res
+            .into_iter()
+            .enumerate()
+            .map(|(a, b)| ((a * b) as f32, (a * a) as f32))
+            .unzip();
+        let slope_core = (core_len as f32 * xy.iter().sum::<f32>() - sum_x * sum_y)
+            / (core_len as f32 * x2.iter().sum::<f32>() - sum_x * sum_x);
+
+        let time_solv = *task_res.get(&MonitoredTasks::Solving).unwrap_or(&0);
+        let time_core = *task_res.get(&MonitoredTasks::CoreProcessing).unwrap_or(&0);
+        let time_spec = *task_res.get(&MonitoredTasks::WCEAdditions).unwrap_or(&0)
+            + *task_res.get(&MonitoredTasks::StrataCreation).unwrap_or(&0)
+            + *task_res.get(&MonitoredTasks::Hardening).unwrap_or(&0);
+
+        let wce_len = wce_res.len() as f32;
+        let core_per_reform = wce_res.into_iter().map(|x| x as i32).sum::<i32>() as f32 / wce_len;
+
+        let unhard_fraction = hard_res.into_iter().product::<f32>();
+
+        println!(
+            "This is summarised in the following data points:\n\
+            Lower Bound Steps: {:?}\n\
+            Lower Bound Step Size: {:?}\n\
+            Lower Bound Update Frequency: {:?}\n\
+            Lower Bound Slope: {:?}\n\
+            Average Core Size: {:?}\n\
+            Core Size Slope: {:?}\n\
+            Time Spent in Solver: {:?}\n\
+            Time Spent Processing Cores: {:?}\n\
+            Time Spent on Special Operations: {:?}\n\
+            Average Number of Reformulation Cores: {:?}\n\
+            Total Unhardened Fraction: {:?}",
+            lb_len,
+            lb_step_size,
+            lb_step_freq,
+            slope_lb,
+            core_size,
+            slope_core,
+            time_solv,
+            time_core,
+            time_spec,
+            core_per_reform,
+            unhard_fraction,
+        );
+
+        let is_optimal = proven && !obj.is_nan();
+        let obj_of_optimal = if is_optimal { obj } else { f32::NAN };
+
+        let total_time = time_solv + time_core + time_spec;
+        let nnodes = self.satisfaction_solver.get_number_of_decisions();
+
+        println!("-=- CSV version -=-");
+        println!("lb_nstep;lb_size;lb_slope;core_size;core_slope;time_solv;time_core;time_special;ncore_reform;unhard_frac;obj;is_optimal;optimal_found_value;nnodes;total_time");
+        println!("{lb_len};{lb_step_size};{slope_lb};{core_size};{slope_core};{time_solv};{time_core};{time_spec};{core_per_reform};{unhard_fraction};{obj};{is_optimal};{obj_of_optimal};{nnodes};{total_time}");
+        println!("-=- End of CSV -=-");
+    }
+
     /// Changes the assumptions composing a core to resolve the conflict. Removes the [`Literal`]s
     /// present in the core from the list of assumptions, depending on the weight handling approach
     /// (i.e. lower weight accordingly in the case of weight splitting); adds a new [`Literal`]
@@ -1435,44 +1389,30 @@ impl Solver {
         weights_per_var: &mut HashMap<u32, (i32, i32)>,
     ) -> (i32, Option<(DomainId, i32)>) {
         // Keep track of the cost incurred by resolving the core.
-        let (cost, assum);
-
-        if core.len() == 1 {
+        let (cost, assum) = if core.len() == 1 {
             // Unit cores are handled separately, with relatively small differences between the
             // different approaches
-            cost =
-                self.process_unit_core(core,
-                                       assumptions,
-                                       variable_reformulation,
-                                       coefficient_elimination,
-                                       weights_per_var
-                );
-            assum = None;
+            (
+                self.process_unit_core(
+                    core[0],
+                    assumptions,
+                    variable_reformulation,
+                    coefficient_elimination,
+                    weights_per_var,
+                ),
+                None,
+            )
         } else {
             debug!("Core has a length of {}", core.len());
             // Larger cores
-            if !variable_reformulation {
-                // slice-based
-                let (new_cost, new_assum) = self.process_core_slice(
-                    assumptions,
-                    core,
-                    weights_per_var,
-                    coefficient_elimination,
-                );
-                cost = new_cost;
-                assum = Some(new_assum);
+            let (new_cost, new_assum) = if variable_reformulation {
+                self.process_core_var(assumptions, core, weights_per_var, coefficient_elimination)
             } else {
-                // variable-based
-                let (new_cost, new_assum) = self.process_core_var(
-                    assumptions,
-                    core,
-                    weights_per_var,
-                    coefficient_elimination,
-                );
-                cost = new_cost;
-                assum = Some(new_assum);
-            }
-        }
+                self.process_core_slice(assumptions, core, weights_per_var, coefficient_elimination)
+            };
+            (new_cost, Some(new_assum))
+        };
+        // Remove trivial assumptions
         assumptions.retain(|l| l.to_u32() != 1);
         debug!("Core incurred cost of {}", cost);
         (cost, assum)
@@ -1484,41 +1424,51 @@ impl Solver {
     /// accordingly (if needed). Returns the cost induced by this operation.
     fn process_unit_core(
         &mut self,
-        core: &[Literal],
+        core: Literal,
         assumptions: &mut Vec<Literal>,
         variable_reformulation: bool,
         coefficient_elimination: bool,
         weights_per_var: &mut HashMap<u32, (i32, i32)>,
     ) -> i32 {
-        // For unit cores, bounds are updated through inference.
-        // The processing of this core is thus to remove the old assumption with the old
-        // (impossible) bound, and add one with the new bound.
-        let did = self
-            .get_domain_literal(core[0])
-            .expect("Must have integer variable");
+        // For unit cores, bounds are updated through inference. Remove the old assumption
+        // (with the old, now impossible bound), and add one with the new bound.
+        // let did = self
+        //     .get_domain_literal(core)
+        //     .expect("Must have integer variable");
 
         debug!("Removing core from assumptions");
-        // Unit cores contain a non-negated assumption (i.e. the version present in `assumptions`).
-        let _ = assumptions.remove(assumptions.iter().position(|a| a == &core[0]).unwrap());
+        let _ = assumptions.remove(assumptions.iter().position(|a| a == &core).unwrap());
 
-        // Decompose literal and associated predicate.
-        let old_assumption = self.decompose_literal(core[0]).unwrap();
-        debug!("Assumption was: {:?}", old_assumption);
+        // Decompose to make elements more accessible.
+        let old_assum = self.decompose_literal(core).unwrap();
+        debug!("Assumption was: {:?}", old_assum);
 
-        // Keep track how much the bound has increased (can be more than 1, in the case of
-        // unit cores), this is needed to calculate the cost increase.
-        let diff_in_bound;
-        if old_assumption.is_greater {
-            // If it was a >= relation, create a new >= relation, with the lowered upper bound
-            diff_in_bound = old_assumption.bound - self.upper_bound(&did);
-            assumptions.push(self.get_literal(predicate!(did >= self.upper_bound(&did))));
-        } else {
-            // If it was a <= relation, create <= relation with the higher lower bound
-            diff_in_bound = self.lower_bound(&did) - old_assumption.bound;
-            assumptions.push(self.get_literal(predicate!(did <= self.lower_bound(&did))));
-        }
+        // Keep track of how much the bound has increased (this can be more than 1, in the case of
+        // unit cores); this is needed to calculate the cost increase.
+        // Note: upper/lower bound, and sign, depend on old predicate.
+        let (did, diff_in_bound, pred) = match old_assum {
+            DecomposedPredicate {
+                variable,
+                is_greater: true,
+                bound,
+            } => {
+                let new_bound = self.upper_bound(&variable);
+                let pred = predicate!(variable >= new_bound);
+                (variable, bound - new_bound, pred)
+            }
+            DecomposedPredicate {
+                variable,
+                is_greater: false,
+                bound,
+            } => {
+                let new_bound = self.lower_bound(&variable);
+                let pred = predicate!(variable <= new_bound);
+                (variable, new_bound - bound, pred)
+            }
+        };
+        assumptions.push(self.get_literal(pred));
         debug!(
-            "New assumption was accompanied by bound increase of {}",
+            "New assumption corresponds to bound increase of {}",
             diff_in_bound
         );
 
@@ -1547,25 +1497,14 @@ impl Solver {
             decomposed_core
         );
         // Note: we take the absolute value of the weights, because the sign of the weight has
-        // already been incorporated into the polarity of the predicate corresponding to the
-        // provided literal. As such, incorporating the sign of the weight would counteract this
-        // effect and yield incorrect results.
-        let only_weights: Vec<i32> = decomposed_core.iter().map(|(_, w)| w.0.abs()).collect();
+        // already been incorporated into the polarity of the predicate (from the literal).
+        let only_weights: Vec<i32> = decomposed_core.iter().map(|(_, (w, _))| w.abs()).collect();
 
-        // Calculate several useful constants.
         let core_len: i32 = core.len() as i32;
         let min_weight: i32 = *only_weights.iter().min().unwrap();
         let sum_weight: i32 = only_weights.iter().sum::<i32>();
 
-        // Instantiate variables that are set inside the conditional, but used outside of it.
-        let (var_weights, d, d_weight);
-        if weight_elimination {
-            // In weight elimination, d is defined using the weighted sum of the elements of the
-            // core. This sum itself thus has weight 1, and the relation is defined by the list
-            // of residual weights.
-            d_weight = 1;
-            var_weights = only_weights;
-
+        let (var_weights, d, d_weight) = if weight_elimination {
             debug!("Removing core from assumptions");
             // All original assumptions are included in the new variable, and are thus removed.
             Solver::remove_core_from_assumptions(core, assumptions);
@@ -1588,53 +1527,49 @@ impl Solver {
                 }))
             }
 
-            // Since we want to remove the unsatisfiability, we know that at least one of the
-            // elements of d needs to be satisfied. As such, a lower bound of 0 is impossible.
-            // The lowest feasible option corresponds to the lowest weight of a single element.
+            // In weight elimination, `d` is the weighted sum of the elements of the core. It has no
+            // weight itself, and its lower bound is the minimal weight - corresponding to the slice
+            // with this weight being assigned 1.
             debug!(
-                "Adding new variable with domain [{},{}] (w: {})",
-                min_weight, sum_weight, d_weight,
+                "Adding new variable with domain [{},{}] (w: 1)",
+                min_weight, sum_weight
             );
-            d = self.new_bounded_integer(min_weight, sum_weight);
+            (
+                only_weights,
+                self.new_bounded_integer(min_weight, sum_weight),
+                1,
+            )
         } else {
-            // In weight splitting, d is defined as the sum of the elements in the core, and an
-            // equal fraction of weight is transferred from every element to d. As such, it takes
-            // over this weight - corresponding to the lowest among the residual weights - and uses
-            // unit weights in its relation to the core.
-            d_weight = min_weight;
-            var_weights = vec![1_i32; core_len as usize];
-
-            // Update the weights of the elements in the core, and return what assumptions should
-            // be removed and added
+            // Update the weights of the core elements; decrease their residual weight, and update
+            // assumptions accordingly (through both addition and removal).
             let (to_remove, to_add) =
                 self.process_weight_split(&decomposed_core, weights_per_var, min_weight, true);
-            // Remove the elements marked for removal.
             debug!("Removing marked assumptions from assumptions");
             Solver::remove_core_from_assumptions(&to_remove, assumptions);
-            // Add elements marked for addition.
             debug!("Adding {} new (slice) assumptions", to_add.len());
             assumptions.extend_from_slice(&to_add);
 
-            // Note that, to remove the unsatisfiability, at least 1 of the elements of the core
-            // needs to be satisfied, and thus d has a lower bound of 1.
+            // In weight splitting, `d` is the unweighted sum of the elements in the core, and has a
+            // weight of `w_min` - the portion of weight removed from its elements. Its lower bound
+            // is 1, corresponding to any element being assigned 1.
             debug!(
                 "Adding new variable with domain [1,{}] (w: {})",
-                core_len, d_weight
+                core_len, min_weight
             );
-            d = self.new_bounded_integer(1, core_len);
-        }
+            (
+                vec![1_i32; core_len as usize],
+                self.new_bounded_integer(1, core_len),
+                min_weight,
+            )
+        };
 
-        // Encode relation.
+        // Encode relation and set weight in weight map.
         boolean_equals(var_weights, core.iter().map(|l| !*l).collect::<Vec<_>>(), d)
             .post(self, None)
             .expect("Could not add boolean cardinality constraint");
-        // Set weight.
         assert!(weights_per_var.insert(d.id, (d_weight, d_weight)).is_none());
 
-        // The current cost assumes all elements in the core to be false. The lower bound on d
-        // corresponds to the number of relaxations needed to remove unsatisfiability, all of which
-        // incur a cost of d_weight. This results in the total cost: lb_d * w_d
-        // Also return the information needed for the new assumption d <= lb_d
+        // The current cost corresponds to `d = 0`; as such, cost is `w_d * lb_d`
         let lb = self.lower_bound(&d);
         (lb * d_weight, (d, lb))
     }
@@ -1654,100 +1589,75 @@ impl Solver {
             decomposed_core
         );
         // Determine the components of the reformulation variable.
-        let mut vars: Vec<AffineView<DomainId>> = decomposed_core
+        let (mut vars, weights): (Vec<AffineView<DomainId>>, Vec<i32>) = decomposed_core
             .iter()
             .map(|(d_pred, (w, _))| {
-                d_pred.variable.scaled(match weight_elimination {
-                    // For coefficient elimination, we "absorb" all variables and their full
-                    // weights into the reformulation variable d.
-                    true => *w,
-                    // For weight splitting, we want the polarity of all weights to be the same,
-                    // to make sure we handle them properly:
-                    // 5a - 4b ==> (1+4)a + 4(-b) ==> 1a + 4d; d = a-b
-                    _ => w.signum(),
-                })
+                // Scale variables and retrieve all weights.
+                // In coefficient elimination, `d` is a weighted sum, and thus the variables are
+                // scaled by weight. In weight splitting, it is unweighted, so we scale by polarity:
+                // 5a - 4b ==> (1+4)a + 4(-b) ==> 1a + 4d; d = a-b
+                (
+                    d_pred
+                        .variable
+                        .scaled(if weight_elimination { *w } else { w.signum() }),
+                    w.abs(),
+                )
             })
-            .collect();
+            .unzip();
 
-        // Determine the upper and lower bounds of each variable (with adjusted polarity or
-        // weight, depending on the weight handling approach).
-        let bounds: (Vec<i32>, Vec<i32>) = vars
+        // Determine the (scaled) upper and lower bounds of each variable.
+        let (lbs, ubs): (Vec<i32>, Vec<i32>) = vars
             .iter()
             .map(|var| (self.lower_bound(var), self.upper_bound(var)))
             .unzip();
 
-        // Summing the respective upper and lower bounds of the variables as determined before,
-        // yields the upper and lower bound of the reformulation variable. Note that, to remove
-        // infeasibility, the lower bound will need to be increased further.
-        let (lb, ub): (i32, i32) = (bounds.0.iter().sum(), bounds.1.iter().sum());
-
-        // The minimum weight is needed to either decrease the weights of core elements, or as an
-        // increase for the lower bound on the reformulation variable.
-        let min_weight = decomposed_core
-            .iter()
-            .map(|(_, (w1, _))| w1.abs())
-            .min()
-            .unwrap();
+        // Summing the bounds yields the upper and lower bound of the reformulation variable.
+        // Note that this original lower bound still corresponds to the infeasible state.
+        let (lb, ub): (i32, i32) = (lbs.iter().sum(), ubs.iter().sum());
+        let min_weight = weights.into_iter().min().unwrap();
 
         // These variables depend on the weight handling approach
-        let (d, d_weight);
-        if weight_elimination {
-            // As with slice-based.
-            d_weight = 1;
-
-            // The entire core is "absorbed" by the reformulation, as such they can all be removed
-            // from the assumptions
+        let (d, d_weight) = if weight_elimination {
+            // The entire core is replaced by the reformulation variable; remove everything.
             debug!("Removing core from assumptions");
             Solver::remove_core_from_assumptions(core, assumptions);
 
-            // As with slice-based; since we need to remove the unsatisfiability, the
-            // lowest weight of a single element needs to be added to the previously calculated
-            // lower bound for a feasible value.
+            // As with slice-based; the reformulation variable si a weighted sum with a lower bound
+            // that is `w_{min}` higher than it is in the current state.
             debug!(
-                "Adding new variable with domain: [{}, {}] (w: {})",
+                "Adding new variable with domain: [{}, {}] (w: 1)",
                 lb + min_weight,
-                ub,
-                d_weight
+                ub
             );
-            d = self.new_bounded_integer(lb + min_weight, ub);
+            (self.new_bounded_integer(lb + min_weight, ub), 1)
         } else {
-            // As with slice-based.
-            d_weight = min_weight;
-
-            // As with slice-based; however, since we work on variables, no new sliced need to be
-            // added to the assumptions. These values are also immediately incorporated into the
-            // reformulation variable.
+            // As with slice-based; however, since we work on variables, no new slices need to be
+            // added to the assumptions; these are accounted for by the reformulation variable.
             let (to_remove, _) =
                 self.process_weight_split(&decomposed_core, weights_per_var, min_weight, false);
-            // Remove marked elements.
             debug!("Removing marked elements from assumptions");
             Solver::remove_core_from_assumptions(&to_remove, assumptions);
 
-            // As with slice-based; 1 needs to be added to ensure unsatisfiability is removed.
+            // At least 1 elements needs to be assigned a higher value, so LB increases by 1.
             debug!(
                 "Adding new variable with domain: [{}, {}] (w: {})",
                 lb + 1,
                 ub,
-                d_weight
+                min_weight
             );
-            d = self.new_bounded_integer(lb + 1, ub);
-        }
+            (self.new_bounded_integer(lb + 1, ub), min_weight)
+        };
 
-        // Assign coefficient -1 to reformulation variable:
-        // d = a + b + c <=> 0 = a + b + c - d
+        // Assign coefficient -1 to reformulation variable:  d = a + b + c <=> 0 = a + b + c - d
+        // Note that <= is enough; `d` could increase further, but this is prevented by assumptions.
         vars.push(d.scaled(-1));
         less_than_or_equals(vars, 0)
             .post(self, None)
             .expect("Could not add cardinality constraint");
-
-        // Insert new weight
         assert!(weights_per_var.insert(d.id, (d_weight, d_weight)).is_none());
 
-        // The current total cost caused by the variables considered here is summarised in lb; it
-        // contains the weighted sum of all elements from the core. The actual lower bound on d will
-        // exceed this; as is needed to remove unsatisfiability. Any increase incurs a cost,
-        // of d_weight. As such, the total cost is: (lb_d - lb) * w_d
-        // Also return the information needed for the new assumption d <= lb_d
+        // The current cost corresponds to `d == lb`; as such, the cost is the difference in lower
+        // bound multiplied by the weight.
         let lb_d = self.lower_bound(&d);
         ((lb_d - lb) * d_weight, (d, lb_d))
     }
@@ -1764,20 +1674,19 @@ impl Solver {
     ) -> (Vec<Literal>, Vec<Literal>) {
         let mut to_remove = vec![];
         let mut to_add = vec![];
-        for (dec_lit, w) in decomposed_core {
+        for (dec_lit, (w_res, w_orig)) in decomposed_core {
             // Decrease the (magnitude of the) weight by `min_weight`.
-            // Note: for positive weights, this is w - w_min, for negative weights it is w + w_min.
-            let mut new_w_res = w.0 - (w.0.signum() * min_weight);
+            // Note: this is `w - w_min` for positive `w` and `w + w_min` for negative `w`.
+            let mut new_w_res = *w_res - (w_res.signum() * min_weight);
             if new_w_res == 0 {
-                // This variable is now fully absorbed into the reformulation
-                // and can thus be removed from the assumptions.
+                // This variable is now fully accounted for by reformulation variables and can thus
+                // be removed from the assumptions.
                 let DecomposedPredicate {
                     variable,
                     is_greater,
                     bound,
                 } = *dec_lit;
                 debug!("Variable {} now has 0 weight", variable);
-                // Mark old assumption for removal.
                 to_remove.push(self.get_literal(if is_greater {
                     predicate!(variable >= bound)
                 } else {
@@ -1785,21 +1694,20 @@ impl Solver {
                 }));
 
                 if add_next_slice {
-                    debug!("Adding next slice and resetting weight to {}", w.1);
-                    // If we are instructed to add the next slice upon weight exhaustion,
-                    // generate the corresponding literal and reset the weight.
+                    debug!("Adding next slice and resetting weight to {}", w_orig);
+                    // Generate the literal corresponding to the next slice and reset the weight.
                     to_add.push(self.get_literal(if is_greater {
                         predicate!(variable >= bound - 1)
                     } else {
                         predicate!(variable <= bound + 1)
                     }));
-                    new_w_res = w.1;
+                    new_w_res = *w_orig;
                 }
             }
             // Update the weight in the weight storage
             let _ = weights_per_var
                 .entry(dec_lit.variable.id)
-                .and_modify(|(w1, _)| *w1 = new_w_res);
+                .and_modify(|(old_w_res, _)| *old_w_res = new_w_res);
         }
         (to_remove, to_add)
     }
@@ -1810,76 +1718,158 @@ impl Solver {
         &mut self,
         delayed_assumptions: &mut Vec<(DomainId, i32)>,
         weights_per_var: &mut HashMap<u32, (i32, i32)>,
+        wce_stat: &mut WCECoreAmountMonitor,
+        coefficient_elimination: bool,
+        variable_reformulation: bool,
     ) -> (Vec<Literal>, i32) {
-        // Note: add the assumption with the up-to-date lower bound
-        debug!("Converting delayed assumptions");
-        let res_assum = delayed_assumptions
-            .iter()
-            .map(|(did, _)| self.get_literal(predicate!(did <= self.lower_bound(did))))
-            .collect();
+        let wce_len = delayed_assumptions.len();
+        debug!("Adding delayed assumptions: {}", wce_len);
+        wce_stat.record_reformulation(wce_len);
 
-        // All assumptions which have an altered bound incur an additional
-        // cost. Calculate this cost.
-        let res_cost = delayed_assumptions
+        // All assumptions whose bound changed incur an additional cost. Calculate this cost.
+        // Note: add the assumption with the up-to-date lower bound, not stored lower bound.
+        let (res_assum, res_cost): (Vec<Literal>, Vec<i32>) = delayed_assumptions
             .iter()
             .map(|(did, bound)| {
-                self.calculate_cost_of_increased_lb(
-                    *did,
-                    self.lower_bound(did) - bound,
-                    weights_per_var,
-                    false,
-                    false,
+                (
+                    self.get_literal(predicate!(did <= self.lower_bound(did))),
+                    self.calculate_cost_of_increased_lb(
+                        *did,
+                        self.lower_bound(did) - bound,
+                        weights_per_var,
+                        !coefficient_elimination,
+                        !variable_reformulation,
+                    ),
                 )
             })
-            .sum::<i32>();
-
-        // All delayed assumptions have been added, and thus the list can be reset.
-        debug!("Clearing delayed assumptions");
+            .unzip();
+        // All delayed assumptions have been processed, and thus the list can be reset.
         delayed_assumptions.clear();
-        (res_assum, res_cost)
+
+        let total_res_cost = res_cost.iter().sum();
+        if total_res_cost != 0 {
+            debug!(
+                "LB's of delayed assumptions incurred additional cost: {}",
+                total_res_cost
+            );
+        }
+        (res_assum, total_res_cost)
+    }
+
+    /// Process the next stratum in the provided list of strata. Returns the assumptions needed to
+    /// activate said stratum, and the additional cost that may be induced by earlier bound changes.
+    fn process_stratum(
+        &self,
+        unadded_parts_of_objective_function: &mut Vec<(Vec<VarWithBound>, i32)>,
+    ) -> (Vec<Literal>, i32) {
+        debug!(
+            "{} strata remaining",
+            unadded_parts_of_objective_function.len()
+        );
+        let (stratum, weight) = unadded_parts_of_objective_function.pop().unwrap();
+        debug!("Adding stratum of length {} (w: {})", stratum.len(), weight);
+
+        // Make assumptions from stratum, and calculate lower bound difference.
+        let (new_assum, diff) = self.create_assumptions_with_lb_diff(stratum);
+        let cost = weight * diff.iter().sum::<i32>();
+        if cost != 0 {
+            debug!("LB's of stratum incurred additional cost: {}", cost);
+        }
+        (new_assum, cost)
+    }
+
+    /// Adds the constraints associated with hardening, if the current solution warrants any.
+    fn process_hardening(
+        &mut self,
+        mapped_obj_val: i32,
+        obj_var: &AffineView<DomainId>,
+        objective_function: &[(i32, DomainId)],
+        bias: &i32,
+        weights_per_var: &HashMap<u32, (i32, i32)>,
+        hard_stat: &mut HardeningDomainLimitationMonitor,
+    ) {
+        // Harden the full objective; useful for inference.
+        self.add_clause(vec![self.get_literal(predicate!(obj_var <= mapped_obj_val))])
+            .expect("Could not harden");
+
+        // Calculate the domain gap and use this to calculate the new domain sizes
+        // of each variable (for statistics, as well as through constraints).
+        // Note: we calculate the inferred LB to ensure correctness.
+        let inferred_lb = objective_function
+            .iter()
+            .map(|(w, did)| self.lower_bound(&did.scaled(*w)))
+            .sum::<i32>()
+            - bias;
+        let gap = mapped_obj_val - inferred_lb;
+        debug!("Gap is {} - {} = {}", mapped_obj_val, inferred_lb, gap);
+
+        let mut fraction = 1.0;
+        for (did_id, (_, w)) in weights_per_var.iter() {
+            // Fetch [`DomainId`] and use it to determine the bounds (given the right polarity).
+            let did = DomainId::new(*did_id);
+            let scaled = did.scaled(w.signum());
+            let (lb, ub) = (self.lower_bound(&scaled), self.upper_bound(&scaled));
+            let scaled_gap = gap / w.abs();
+            let bound = lb + scaled_gap;
+            if ub > bound {
+                // Any variable `x` with weight `w` can in theory increase obj by `w*(ub_x - lb_x)`.
+                // In other words, if obj can increase at most `gap`, we know that
+                // `(ub_x - lb_x)*w <= gap <-> ub_x <= lb_x + gap / w`
+                // Note: use the original weight; this gives tighter (but still correct) bounds.
+                debug!("Hardening {} to [{}, {}] (was {})", did, lb, bound, ub);
+                self.add_clause(vec![self.get_literal(predicate!(scaled <= bound))])
+                    .expect("Could not harden");
+                // Note: both `ub` and `lb` are part of the domain, so domain size is `ub - lb + 1`
+                fraction *= ((scaled_gap + 1) as f32) / ((ub - lb + 1) as f32);
+            }
+        }
+        hard_stat.hardened(fraction);
     }
 
     /// Calculates the cost of increased cost for a given variable. The boolean
-    /// `use_up_residual_weight` determines whether the residual weight should be considered and
-    /// immediately reset for the given variable.
+    /// `use_up_residual_weight` determines whether the residual weight should be considered, and
+    /// `consume_used_residual_weight` determines whether it should be immediately reset.
     fn calculate_cost_of_increased_lb(
         &self,
         did: DomainId,
         diff: i32,
         weights_per_var: &mut HashMap<u32, (i32, i32)>,
         use_residual_weight: bool,
-        consume_residual_weight: bool,
+        consume_used_residual_weight: bool,
     ) -> i32 {
-        let mut cost = 0;
-
         // Multiply the bound increase with associated weight.
-        let (res_weight, orig_weight) = *weights_per_var
-            .get(&did.id)
+        let (res_weight, orig_weight) = weights_per_var
+            .get_mut(&did.id)
             .expect("Variable must have weights");
-        if use_residual_weight && consume_residual_weight && diff > 0 {
-            // NOTE: when using slice-based weight splitting, the first increase step uses the
-            // residual weight, not the full weight. Correct the cost for this single step.
-            cost += res_weight - orig_weight;
-            // When "used up", reset the residual weight.
-
-            debug!("Resetting residual weight for variable {}", did);
-            let _ = weights_per_var
-                .entry(did.id)
-                .and_modify(|(w_res, w_orig)| *w_res = *w_orig);
-        } else {
-            let w = if use_residual_weight {res_weight} else {orig_weight};
-            cost += diff * w;
+        if diff < 0 {
+            warn!("Negative diff in calculate_cost_of_increased_lb: {}, for {}", diff, did);
         }
 
-        cost
+        match (use_residual_weight, consume_used_residual_weight) {
+            (true, true) => {
+                // If the residual weight needs to be consumed, check whether the difference is
+                // indeed non-zero; being zero would prevent it from consuming the weight.
+                if diff.abs() > 0 {
+                    let delta = diff.signum(); // Make sure polarity is correct
+                    let c = (diff - delta) * orig_weight.abs() + delta * res_weight.abs();
+                    debug!("Resetting residual weight for variable {}", did);
+                    *res_weight = *orig_weight;
+                    c
+                } else {
+                    0
+                }
+            }
+            (true, false) => diff * res_weight.abs(),
+            _ => diff * orig_weight.abs(),
+        }
     }
 
     /// Takes as input a list of variables and their bounds, and returns two lists. The first is the
-    /// list of literals corresponding to the assumptions `x <= l_x` for variables `x` with lower
-    /// bounds `l_x`. The second is the list of differences between actual and provided lower
-    /// bounds, used to calculate incurred cost.
+    /// list of literals corresponding to the assumptions `x <= lb_x` for variables `x` with lower
+    /// bounds `lb_x`. The second is the list of differences between actual and provided lower
+    /// bounds, used (later) to calculate incurred cost.
     fn create_assumptions_with_lb_diff(
-        &mut self,
+        &self,
         stratum: Vec<VarWithBound>,
     ) -> (Vec<Literal>, Vec<i32>) {
         stratum
@@ -1896,6 +1886,7 @@ impl Solver {
     fn decompose_literal(&mut self, lit: Literal) -> Option<DecomposedPredicate> {
         self.get_integer_predicates_from_literal(lit)
             .find_map(|pred| match pred {
+                // remember variable, type, and used bound
                 IntegerPredicate::LowerBound {
                     domain_id: variable,
                     lower_bound: bound,
@@ -1904,7 +1895,6 @@ impl Solver {
                     is_greater: true,
                     bound,
                 }),
-                // remember variable, type, and used bound
                 IntegerPredicate::UpperBound {
                     domain_id: variable,
                     upper_bound: bound,
@@ -1918,38 +1908,27 @@ impl Solver {
     }
 
     /// Takes a core (or any other vector of literals) and maps its literals to the
-    /// [`DecomposedPredicate`]s corresponding to their assumptions.
-    fn decompose_core(&mut self, core: &[Literal]) -> Vec<DecomposedPredicate> {
-        core.iter()
-            .filter_map(|c| {
-                // get predicate from assumption
-                self.decompose_literal(*c)
-            })
-            .collect::<Vec<DecomposedPredicate>>()
-    }
-
-    /// Takes the result of [`Solver::decompose_core`] and matches it with the weights, as provided
-    /// by the third argument. This allows easy access to (nearly) all relevant data for the
-    /// predicates present in a core.
+    /// [`DecomposedPredicate`]s corresponding to their assumptions, which are subsequently matched
+    /// with the weights as provided by the third argument. This allows easy access to (nearly)
+    /// all relevant data for the predicates present in a core.
     fn decompose_with_weights(
         &mut self,
         core: &[Literal],
         weights_per_var: &HashMap<u32, (i32, i32)>,
     ) -> Vec<(DecomposedPredicate, (i32, i32))> {
-        let decomposed_core = self.decompose_core(core);
+        let decomposed_core = core
+            .iter()
+            .filter_map(|c| self.decompose_literal(*c))
+            .collect::<Vec<DecomposedPredicate>>();
         assert_eq!(decomposed_core.len(), core.len());
         decomposed_core
             .into_iter()
             .map(|d_pred| {
-                // match with weights
-                (
-                    *weights_per_var
-                        .get(&d_pred.variable.id)
-                        .expect("Weight needed for every domain id"),
-                    d_pred,
-                )
+                let w = *weights_per_var
+                    .get(&d_pred.variable.id)
+                    .expect("Weight needed for every domain id");
+                (d_pred, w)
             })
-            .map(|(a, b)| (b, a))
             .collect()
     }
 }
