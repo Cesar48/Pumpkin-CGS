@@ -1430,11 +1430,6 @@ impl Solver {
         coefficient_elimination: bool,
         weights_per_var: &mut HashMap<u32, (i32, i32)>,
     ) -> i32 {
-        // For unit cores, bounds are updated through inference. Remove the old assumption
-        // (with the old, now impossible bound), and add one with the new bound.
-        // let did = self
-        //     .get_domain_literal(core)
-        //     .expect("Must have integer variable");
 
         debug!("Removing core from assumptions");
         let _ = assumptions.remove(assumptions.iter().position(|a| a == &core).unwrap());
@@ -1788,9 +1783,22 @@ impl Solver {
         weights_per_var: &HashMap<u32, (i32, i32)>,
         hard_stat: &mut HardeningDomainLimitationMonitor,
     ) {
+        let domain_sizes = objective_function
+            .iter()
+            .map(|(_, d)| self.upper_bound(d) - self.lower_bound(d) + 1)
+            .collect::<Vec<_>>();
         // Harden the full objective; useful for inference.
         self.add_clause(vec![self.get_literal(predicate!(obj_var <= mapped_obj_val))])
             .expect("Could not harden");
+        let mut fraction = domain_sizes
+            .into_iter()
+            .zip(
+                objective_function
+                    .iter()
+                    .map(|(_, d)| self.upper_bound(d) - self.lower_bound(d) + 1),
+            )
+            .map(|(a, b)| b as f32 / a as f32)
+            .product();
 
         // Calculate the domain gap and use this to calculate the new domain sizes
         // of each variable (for statistics, as well as through constraints).
@@ -1803,7 +1811,6 @@ impl Solver {
         let gap = mapped_obj_val - inferred_lb;
         debug!("Gap is {} - {} = {}", mapped_obj_val, inferred_lb, gap);
 
-        let mut fraction = 1.0;
         for (did_id, (_, w)) in weights_per_var.iter() {
             // Fetch [`DomainId`] and use it to determine the bounds (given the right polarity).
             let did = DomainId::new(*did_id);
@@ -1821,8 +1828,14 @@ impl Solver {
                     .expect("Could not harden");
                 // Note: both `ub` and `lb` are part of the domain, so domain size is `ub - lb + 1`
                 fraction *= ((scaled_gap + 1) as f32) / ((ub - lb + 1) as f32);
+            } else {
+                debug!(
+                    "NOT hardening {}; [{}, {}] is smaller than {}",
+                    did, lb, ub, scaled_gap
+                );
             }
         }
+
         hard_stat.hardened(fraction);
     }
 
@@ -1842,7 +1855,10 @@ impl Solver {
             .get_mut(&did.id)
             .expect("Variable must have weights");
         if diff < 0 {
-            warn!("Negative diff in calculate_cost_of_increased_lb: {}, for {}", diff, did);
+            warn!(
+                "Negative diff in calculate_cost_of_increased_lb: {}, for {}",
+                diff, did
+            );
         }
 
         match (use_residual_weight, consume_used_residual_weight) {
