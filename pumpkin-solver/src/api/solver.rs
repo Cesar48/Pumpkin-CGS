@@ -1291,7 +1291,7 @@ impl Solver {
         let lb_len = lb_vals.len();
         let lb_step_freq = *lb_times.last().expect("Expected lower bound") as f32 / lb_len as f32;
         let lb_step_size =
-            (*lb_vals.last().unwrap() - *lb_vals.first().unwrap()) as f32 / lb_len as f32;
+            (*lb_vals.last().unwrap() - *lb_vals.first().unwrap()) as f32 / (lb_len - 1) as f32;
 
         // Calculate optimal slope for linear approximation.
         let lb_incs: Vec<f32> = lb_vals
