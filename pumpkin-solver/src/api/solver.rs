@@ -469,11 +469,11 @@ impl Solver {
         termination: &mut impl TerminationCondition,
         objective_variable: DomainId,
         core_guided_options: Option<CoreGuidedArgs>,
-        objective_definition: Option<(Vec<(i32, DomainId)>, i32)>,
+        objective_definition: Option<ObjectiveDefinition>,
     ) -> OptimisationResult {
         match core_guided_options {
             Some(x) => {
-                let (true_objective, bias) = match objective_definition {
+                let true_objective = match objective_definition {
                     Some(y) => y,
                     None => (vec![(1_i32, objective_variable)], 0),
                 };
@@ -482,7 +482,6 @@ impl Solver {
                     termination,
                     x,
                     true_objective,
-                    bias,
                     objective_variable.into(),
                     false,
                 )
@@ -503,11 +502,11 @@ impl Solver {
         termination: &mut impl TerminationCondition,
         objective_variable: DomainId,
         core_guided_options: Option<CoreGuidedArgs>,
-        objective_definition: Option<(Vec<(i32, DomainId)>, i32)>,
+        objective_definition: Option<ObjectiveDefinition>,
     ) -> OptimisationResult {
         match core_guided_options {
             Some(x) => {
-                let (true_objective, bias) = match objective_definition {
+                let true_objective = match objective_definition {
                     Some(y) => (y.0.into_iter().map(|(w, v)| (-w, v)).collect(), -y.1),
                     None => (vec![(-1_i32, objective_variable)], 0),
                 };
@@ -516,7 +515,6 @@ impl Solver {
                     termination,
                     x,
                     true_objective,
-                    bias,
                     objective_variable.scaled(-1),
                     true,
                 )
@@ -841,6 +839,10 @@ pub(crate) struct DecomposedPredicate {
     bound: i32,
 }
 
+/// An objective function is (generally) defined as `obj = \Sigma_i w_i*x_i + bias`. This type
+/// definition allows this full objective function to be contained in a single object.
+pub(crate) type ObjectiveDefinition = (Vec<(i32, DomainId)>, i32);
+
 /// In stratification and WCE, variables are passed around with (potentially outdated) lower bounds.
 /// These bounds are vital in calculating additional cost etc., and must be associated with the
 /// variables at all times. This type ensures that these values stay associated with one another.
@@ -961,8 +963,7 @@ impl Solver {
         brancher: &mut impl Brancher,
         termination: &mut impl TerminationCondition,
         core_guided_options: CoreGuidedArgs,
-        objective_function: Vec<(i32, DomainId)>,
-        bias: i32,
+        objective_function: ObjectiveDefinition,
         obj_var: AffineView<DomainId>,
         _is_maximising: bool,
     ) -> OptimisationResult {
@@ -973,9 +974,10 @@ impl Solver {
             "Start of CGS minimisation, with following options: {:?}",
             core_guided_options
         );
+        let (objective_terms, bias) = objective_function;
         debug!(
             "Objective function is as follows: {} + {}",
-            objective_function
+            objective_terms
                 .iter()
                 .map(|(w, var)| format!("{}*{}", w, var))
                 .join(" + "),
@@ -987,13 +989,12 @@ impl Solver {
             // The vector allows the length to be checked (alongside whether it is empty).
             // Note: the strata need the lower bound (with correct polarity), and (absolute) weight.
             stat.tpt.start_task(MonitoredTasks::StrataCreation);
-            let strata =
-                StratificationPartitioner::new(objective_function.iter().map(|(w, did)| {
-                    let scaled = did.scaled(w.signum());
-                    let lb = self.lower_bound(&scaled);
-                    (w.abs(), (scaled, lb))
-                }))
-                .all_strata();
+            let strata = StratificationPartitioner::new(objective_terms.iter().map(|(w, did)| {
+                let scaled = did.scaled(w.signum());
+                let lb = self.lower_bound(&scaled);
+                (w.abs(), (scaled, lb))
+            }))
+            .all_strata();
 
             debug!(
                 "Stratification active, {} strata: {:?}",
@@ -1008,7 +1009,7 @@ impl Solver {
         } else {
             // If stratification is inactive, create a single stratum with all objective variables
             vec![(
-                objective_function
+                objective_terms
                     .iter()
                     .map(|(w, did)| {
                         let scaled = did.scaled(w.signum());
@@ -1035,7 +1036,7 @@ impl Solver {
 
         // Keep track of the lower bound on the objective, as governed by the assumptions.
         // Note: this is `bias` above the actual (proven) lower bound.
-        let mut current_lower_bound = objective_function
+        let mut current_lower_bound = objective_terms
             .iter()
             .map(|(w, did)| self.lower_bound(&did.scaled(*w)))
             .sum::<i32>();
@@ -1044,7 +1045,7 @@ impl Solver {
         // Save the residual resp. original weights of each variable. Note that residual is only
         // used in weight splitting, and original is not used in variable-based weight splitting.
         let mut weights_per_var: HashMap<u32, (i32, i32)> = HashMap::from(
-            objective_function
+            objective_terms
                 .iter()
                 .map(|(w, did)| (did.id, (*w, *w)))
                 .collect(),
@@ -1082,7 +1083,7 @@ impl Solver {
                 // If the bounds are violated, this means that all values in the domain of the
                 // objective value are proven infeasible, i.e. the problem is unsatisfiable.
                 proven = true;
-                if !solution.is_none() {
+                if solution.is_some() {
                     // If all values are proven infeasible, but one was found, something's wrong.
                     proven = false;
                     warn!("Solution found before UNSAT; closer inspection required.");
@@ -1126,7 +1127,7 @@ impl Solver {
                     SatisfactionResultUnderAssumptions::Unsatisfiable => {
                         info!("UNSAT proven; exiting...");
                         proven = true;
-                        if !solution.is_none() {
+                        if solution.is_some() {
                             // If the unsatisfiability is unconditional, solution should be None.
                             proven = false;
                             warn!("Solution found before UNSAT; closer inspection required.");
@@ -1222,8 +1223,8 @@ impl Solver {
                         self.process_hardening(
                             hi,
                             &obj_var,
-                            &objective_function,
-                            &bias,
+                            &objective_terms,
+                            bias,
                             &weights_per_var,
                             &mut stat.hdl,
                         );
@@ -1430,7 +1431,6 @@ impl Solver {
         coefficient_elimination: bool,
         weights_per_var: &mut HashMap<u32, (i32, i32)>,
     ) -> i32 {
-
         debug!("Removing core from assumptions");
         let _ = assumptions.remove(assumptions.iter().position(|a| a == &core).unwrap());
 
@@ -1778,12 +1778,12 @@ impl Solver {
         &mut self,
         mapped_obj_val: i32,
         obj_var: &AffineView<DomainId>,
-        objective_function: &[(i32, DomainId)],
-        bias: &i32,
+        objective_terms: &[(i32, DomainId)],
+        bias: i32,
         weights_per_var: &HashMap<u32, (i32, i32)>,
         hard_stat: &mut HardeningDomainLimitationMonitor,
     ) {
-        let domain_sizes = objective_function
+        let domain_sizes = objective_terms
             .iter()
             .map(|(_, d)| self.upper_bound(d) - self.lower_bound(d) + 1)
             .collect::<Vec<_>>();
@@ -1793,7 +1793,7 @@ impl Solver {
         let mut fraction = domain_sizes
             .into_iter()
             .zip(
-                objective_function
+                objective_terms
                     .iter()
                     .map(|(_, d)| self.upper_bound(d) - self.lower_bound(d) + 1),
             )
@@ -1803,7 +1803,7 @@ impl Solver {
         // Calculate the domain gap and use this to calculate the new domain sizes
         // of each variable (for statistics, as well as through constraints).
         // Note: we calculate the inferred LB to ensure correctness.
-        let inferred_lb = objective_function
+        let inferred_lb = objective_terms
             .iter()
             .map(|(w, did)| self.lower_bound(&did.scaled(*w)))
             .sum::<i32>()

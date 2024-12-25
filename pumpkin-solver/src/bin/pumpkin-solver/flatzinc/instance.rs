@@ -25,12 +25,16 @@ impl FlatzincObjective {
     }
 }
 
+/// An objective function is (generally) defined as `obj = \Sigma_i w_i*x_i + bias`. This type
+/// definition allows this full objective function to be contained in a single object.
+pub(crate) type ObjectiveDefinition = (Vec<(i32, DomainId)>, i32);
+
 #[derive(Default)]
 pub(crate) struct FlatZincInstance {
     pub(super) outputs: Vec<Output>,
     pub(super) objective_function: Option<FlatzincObjective>,
     pub(super) search: Option<DynamicBrancher>,
-    pub(super) objective_definition: Option<(Vec<(i32, DomainId)>, i32)>,
+    pub(super) objective_definition: Option<ObjectiveDefinition>,
 }
 
 impl FlatZincInstance {

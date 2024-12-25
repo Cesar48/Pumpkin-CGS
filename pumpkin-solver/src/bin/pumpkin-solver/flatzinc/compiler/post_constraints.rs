@@ -15,6 +15,7 @@ use super::context::CompilationContext;
 use crate::flatzinc::ast::FlatZincAst;
 use crate::flatzinc::compiler::context::Set;
 use crate::flatzinc::instance::FlatzincObjective;
+use crate::flatzinc::instance::ObjectiveDefinition;
 use crate::flatzinc::FlatZincError;
 use crate::flatzinc::FlatZincOptions;
 
@@ -23,7 +24,7 @@ pub(crate) fn run(
     context: &mut CompilationContext,
     options: FlatZincOptions,
     objective_function: &Option<(FlatzincObjective, &String)>,
-) -> Result<Option<(Vec<(i32, DomainId)>, i32)>, FlatZincError> {
+) -> Result<Option<ObjectiveDefinition>, FlatZincError> {
     let mut objective_definition = None;
 
     for constraint_item in &ast.constraint_decls {
@@ -760,7 +761,7 @@ fn process_objective_definition(
     original_vars: &[DomainId],
     original_bias: &i32,
     objective_variable: &FlatzincObjective,
-) -> (Vec<(i32, DomainId)>, i32) {
+) -> ObjectiveDefinition {
     // Save this constraint for later use
     // Note: 'later' is during the solve process, after compilation,
     // and as such the values need to be copied to extend lifetime

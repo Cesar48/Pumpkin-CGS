@@ -4,6 +4,16 @@ use log::warn;
 
 use crate::basic_types::HashMap;
 
+/// A tuple containing the results of all monitors used in the [`StatisticsGroup`]. Used as a
+/// return value for [`StatisticsGroup::get_results`].
+type StatisticsTuple = (
+    Vec<(i32, u128)>,
+    Vec<usize>,
+    HashMap<MonitoredTasks, u128>,
+    Vec<usize>,
+    Vec<f32>,
+);
+
 /// A grouping object for all different statistic monitors defined below. Allows easier
 /// instantiation and access when all or many are needed.
 pub(crate) struct StatisticsGroup {
@@ -27,15 +37,7 @@ impl StatisticsGroup {
     }
 
     /// Retrieve and return the results of all submonitors.
-    pub(crate) fn get_results(
-        self,
-    ) -> (
-        Vec<(i32, u128)>,
-        Vec<usize>,
-        HashMap<MonitoredTasks, u128>,
-        Vec<usize>,
-        Vec<f32>,
-    ) {
+    pub(crate) fn get_results(self) -> StatisticsTuple {
         (
             self.lb.get_result(),
             self.cs.get_result(),
