@@ -378,6 +378,13 @@ struct Args {
     /// This argument specifies whether to do so.
     #[arg(long = "harden", default_value_t = false)]
     harden: bool,
+
+    /// In core-guided search, we can apply partitioning, which divides the objective into several
+    /// smaller problems which are iteratively solved individually, then merged, until the original
+    /// problem is reached after merging the last two partitions.
+    /// This argument specifies whether to do so.
+    #[arg(long = "partition", default_value_t = false)]
+    partition: bool,
 }
 
 fn configure_logging(
@@ -557,6 +564,7 @@ fn run() -> PumpkinResult<()> {
             weight_aware_cores: args.weight_aware_cores,
             stratification: args.stratification,
             harden: args.harden,
+            partition: args.partition,
         })
     } else {
         None

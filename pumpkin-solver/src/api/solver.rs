@@ -1,3 +1,5 @@
+use std::cmp::max;
+use std::cmp::min;
 use std::num::NonZero;
 
 use itertools::Itertools;
@@ -470,6 +472,7 @@ impl Solver {
         objective_variable: DomainId,
         core_guided_options: Option<CoreGuidedArgs>,
         objective_definition: Option<ObjectiveDefinition>,
+        partitioned_instance: Option<PartitionedInstanceData>,
     ) -> OptimisationResult {
         match core_guided_options {
             Some(x) => {
@@ -483,6 +486,7 @@ impl Solver {
                     x,
                     true_objective,
                     objective_variable.into(),
+                    partitioned_instance,
                     false,
                 )
             }
@@ -503,6 +507,7 @@ impl Solver {
         objective_variable: DomainId,
         core_guided_options: Option<CoreGuidedArgs>,
         objective_definition: Option<ObjectiveDefinition>,
+        partitioned_instance: Option<PartitionedInstanceData>,
     ) -> OptimisationResult {
         match core_guided_options {
             Some(x) => {
@@ -516,6 +521,7 @@ impl Solver {
                     x,
                     true_objective,
                     objective_variable.scaled(-1),
+                    partitioned_instance,
                     true,
                 )
             }
@@ -839,10 +845,6 @@ pub(crate) struct DecomposedPredicate {
     bound: i32,
 }
 
-/// An objective function is (generally) defined as `obj = \Sigma_i w_i*x_i + bias`. This type
-/// definition allows this full objective function to be contained in a single object.
-pub(crate) type ObjectiveDefinition = (Vec<(i32, DomainId)>, i32);
-
 /// In stratification and WCE, variables are passed around with (potentially outdated) lower bounds.
 /// These bounds are vital in calculating additional cost etc., and must be associated with the
 /// variables at all times. This type ensures that these values stay associated with one another.
@@ -965,6 +967,7 @@ impl Solver {
         core_guided_options: CoreGuidedArgs,
         objective_function: ObjectiveDefinition,
         obj_var: AffineView<DomainId>,
+        partitioned_objective_data: Option<PartitionedInstanceData>,
         _is_maximising: bool,
     ) -> OptimisationResult {
         let mut stat = StatisticsGroup::new();
@@ -984,59 +987,14 @@ impl Solver {
             -bias
         );
 
-        let mut unadded_parts_of_objective_function = if core_guided_options.stratification {
-            // If stratification is active, calculate the strata and store them in a vector.
-            // The vector allows the length to be checked (alongside whether it is empty).
-            // Note: the strata need the lower bound (with correct polarity), and (absolute) weight.
-            stat.tpt.start_task(MonitoredTasks::StrataCreation);
-            let strata = StratificationPartitioner::new(objective_terms.iter().map(|(w, did)| {
-                let scaled = did.scaled(w.signum());
-                let lb = self.lower_bound(&scaled);
-                (w.abs(), (scaled, lb))
-            }))
-            .all_strata();
-
-            debug!(
-                "Stratification active, {} strata: {:?}",
-                strata.len(),
-                strata
-                    .iter()
-                    .map(|(v, w)| (*w, v.len()))
-                    .collect::<Vec<(i32, usize)>>(),
-            );
-            stat.tpt.end_task(MonitoredTasks::StrataCreation);
-            strata
-        } else {
-            // If stratification is inactive, create a single stratum with all objective variables
-            vec![(
-                objective_terms
-                    .iter()
-                    .map(|(w, did)| {
-                        let scaled = did.scaled(w.signum());
-                        let lb = self.lower_bound(&scaled);
-                        (scaled, lb)
-                    })
-                    .collect(),
-                0,
-            )]
-        };
-
-        // Add assumptions which fix all objective variables to their lower bounds. Note that these
-        // are the initial lower bounds, and thus no additional cost is incurred.
-        let (initial_stratum, _) = unadded_parts_of_objective_function
-            .pop()
-            .expect("Expected at least 1 objective function term");
-        debug!("Initial stratum has length {}", initial_stratum.len());
-        let (mut assumptions, _) = self.create_assumptions_with_lb_diff(initial_stratum);
-
         // This boolean signals whether the result of the solver is 'final'; if a solution is found
         // with no information left to be added, or if unconditional unsatisfiability is found.
-        let mut proven = false;
-        let mut solution: Option<Solution> = None;
+        let mut last_proven = false;
+        let mut last_solution: Option<Solution> = None;
 
         // Keep track of the lower bound on the objective, as governed by the assumptions.
         // Note: this is `bias` above the actual (proven) lower bound.
-        let mut current_lower_bound = objective_terms
+        let current_lower_bound = objective_terms
             .iter()
             .map(|(w, did)| self.lower_bound(&did.scaled(*w)))
             .sum::<i32>();
@@ -1051,193 +1009,112 @@ impl Solver {
                 .collect(),
         );
 
-        // Assumptions delayed through WCE. Note: all reformulation variables have weight >=0.
-        let mut delayed_assumptions: Vec<(DomainId, i32)> = vec![];
-
         stat.lb.update(current_lower_bound);
+
+        let strata = if core_guided_options.stratification {
+            stat.tpt.start_task(MonitoredTasks::StrataCreation);
+            let strata = StratificationPartitioner::new(
+                // Add lower bounds and pass to function.
+                objective_terms
+                    .iter()
+                    .map(|(w, did)| (w, did.scaled(w.signum())))
+                    .map(|(w, did)| {
+                        let lb = self.lower_bound(&did);
+                        (*w, (did, lb))
+                    }),
+            )
+            .all_strata(); // Extract relevant data
+            stat.tpt.end_task(MonitoredTasks::StrataCreation);
+            debug!("Stratification active, number of strata: {}", strata.len(),);
+            strata
+        } else {
+            // When stratification is disabled, consider all objective variables to be part of a
+            // single stratum with undefined weight.
+            let strata = objective_terms
+                .iter()
+                .cloned()
+                .map(|(w, did)| did.scaled(w.signum()))
+                .map(|did| {
+                    let lb = self.lower_bound(&did);
+                    (did, lb)
+                })
+                .collect();
+            vec![(strata, 0)]
+        };
+
+        // Note: the combination of stratification and partitioning is unavailable. Both effectively
+        // `split up` the objective function, and their order strongly affects process and results.
+        let (mut indiv_parts, mut community_distances, partition_time) =
+            if let Some(part_data) = partitioned_objective_data {
+                let partitions = part_data
+                    .communities
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let ass = value
+                            .iter()
+                            .map(|v| {
+                                let scaled = v.scaled(weights_per_var[&v.id].1);
+                                let lb = self.lower_bound(&scaled);
+                                (scaled, lb)
+                            })
+                            .collect::<Vec<_>>();
+                        SinglePartitionData {
+                            partition_id: key,
+                            strata: vec![(ass, 0)],
+                            assumptions: vec![],
+                            lower_bound: 0,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                (
+                    partitions,
+                    part_data.community_distances,
+                    part_data.time_taken,
+                )
+            } else {
+                // We consider stratification in a single partition due to the different processing.
+                let partitions = vec![SinglePartitionData {
+                    partition_id: -1,
+                    strata,
+                    assumptions: vec![],
+                    lower_bound: 0,
+                }];
+                (partitions, HashMap::default(), 0)
+            };
+
         // Repeat until satisfiable
         loop {
-            let (actual_lb, actual_ub) = (self.lower_bound(&obj_var), self.upper_bound(&obj_var));
-            debug!(
-                "Bounds are currently: {} (est. lb), {} (act. lb), {} (ub)",
-                current_lower_bound - bias,
-                actual_lb,
-                actual_ub
-            );
-
-            if current_lower_bound - bias > actual_ub
-                || actual_lb > actual_ub
-                || assumptions.contains(&Literal::u32_to_literal(0))
-            {
-                // If the current estimated lower bound or the actual lower bound exceeds the
-                // actual upper bound, or if one of the assumptions implies false, we have proven
-                // unsatisfiability.
-                info!("Stopping solving process due to violated bounds");
-                debug!(
-                    "est. lb > ub: {}; act. lb > ub: {}; assume false: {}",
-                    current_lower_bound - bias > actual_ub,
-                    actual_lb > actual_ub,
-                    assumptions.contains(&Literal::u32_to_literal(0)),
+            for single_partition in indiv_parts.iter_mut() {
+                // Solve every partition.
+                (last_solution, last_proven) = self.perform_cgs(
+                    &obj_var,
+                    &objective_terms,
+                    &current_lower_bound,
+                    &bias,
+                    single_partition,
+                    &mut weights_per_var,
+                    &mut stat,
+                    &core_guided_options,
+                    brancher,
+                    termination,
                 );
 
-                // If the bounds are violated, this means that all values in the domain of the
-                // objective value are proven infeasible, i.e. the problem is unsatisfiable.
-                proven = true;
-                if solution.is_some() {
-                    // If all values are proven infeasible, but one was found, something's wrong.
-                    proven = false;
-                    warn!("Solution found before UNSAT; closer inspection required.");
+                if last_solution.is_none() && last_proven {
+                    info!("UNSAT proven on single partition; returning...");
+                    // If no solution was found, but this answer is `final`, we have proven
+                    // unsatisfiability. Return these findings.
+                    break;
                 }
+            }
+            if indiv_parts.len() == 1 {
+                debug!("Full problem solved; returning");
+                // Only 1 partition? That's the full problem. Return outcome.
                 break;
             }
 
-            let (core, harden_info) = {
-                // Check satisfiability under current assumptions.
-                stat.tpt.start_task(MonitoredTasks::Solving);
-                let solv_res = self.satisfy_under_assumptions(brancher, termination, &assumptions);
-                stat.tpt.end_task(MonitoredTasks::Solving);
-
-                match solv_res {
-                    // If a solution is found, check if it's better than the previous solution
-                    // (if any), save the best of the two and report absence of a core.
-                    SatisfactionResultUnderAssumptions::Satisfiable(sol) => {
-                        let new_val = sol.lower_bound(&obj_var);
-                        debug!("New solution found with objective value {}", new_val);
-                        let (best_solution, harden_val) = match solution {
-                            // Note: minimisation, so "better" means that `old_obj < new_obj`.
-                            Some(old_sol) if old_sol.lower_bound(&obj_var) <= new_val => {
-                                debug!("Keeping old solution");
-                                (old_sol, None)
-                            }
-                            _ => {
-                                debug!("Using new solution as best so far");
-                                (sol, Some(new_val))
-                            }
-                        };
-                        solution = Some(best_solution);
-                        (None, harden_val) // No core present.
-                    }
-                    // Stop optimisation if Unknown is returned (presumably due to timeout).
-                    SatisfactionResultUnderAssumptions::Unknown => {
-                        info!("Result Unknown returned; presumably timeout");
-                        break;
-                    }
-                    // If the solver reports (unconditional) unsatisfiability, we have proven that
-                    // the base problem is unsatisfiable. Report this.
-                    SatisfactionResultUnderAssumptions::Unsatisfiable => {
-                        info!("UNSAT proven; exiting...");
-                        proven = true;
-                        if solution.is_some() {
-                            // If the unsatisfiability is unconditional, solution should be None.
-                            proven = false;
-                            warn!("Solution found before UNSAT; closer inspection required.");
-                        }
-                        break;
-                    }
-                    // If assumptions cause unsatisfiability, extract the UNSAT core.
-                    SatisfactionResultUnderAssumptions::UnsatisfiableUnderAssumptions(
-                        mut core_extractor,
-                    ) => {
-                        debug!("Core found");
-                        (Some(core_extractor.extract_core()), None)
-                    }
-                }
-            };
-
-            if let Some(c) = core {
-                stat.tpt.start_task(MonitoredTasks::CoreProcessing);
-                info!("Processing core of size {}", c.len());
-                stat.cs.core_found(c.len());
-
-                let (add_cost, new_assum) = self.process_core(
-                    &c,
-                    &mut assumptions,
-                    core_guided_options.variable_reformulation,
-                    core_guided_options.coefficient_elimination,
-                    &mut weights_per_var,
-                );
-                stat.tpt.end_task(MonitoredTasks::CoreProcessing);
-
-                // Update lower bound after every core-processing iteration
-                current_lower_bound += add_cost;
-                stat.lb.update(current_lower_bound);
-
-                // If a new assumption is present, add it in the appropriate place.
-                if let Some((did, lb)) = new_assum {
-                    debug!("Assumption was returned: {:?}", (did, lb));
-                    if core_guided_options.weight_aware_cores {
-                        delayed_assumptions.push((did, lb));
-                    } else {
-                        assumptions.push(self.get_literal(predicate!(did <= lb)));
-                    }
-                }
-            } else if let Some(sol) = solution {
-                // If a solution was found, check if any information was held back. If so, add this
-                // information; if not, report optimality.
-                let (wce_empty, strat_empty) = (
-                    delayed_assumptions.is_empty(),
-                    unadded_parts_of_objective_function.is_empty(),
-                );
-                if wce_empty && strat_empty {
-                    info!("No remaining information, solution is proven to be optimal. Exiting...");
-                    proven = true;
-                    solution = Some(sol); // Restore ownership
-                    break;
-                }
-
-                // WCE: add any previously created reformulation variables.
-                if !wce_empty {
-                    stat.tpt.start_task(MonitoredTasks::WCEAdditions);
-                    let (new_assum, cost) = self.process_wce(
-                        &mut delayed_assumptions,
-                        &mut weights_per_var,
-                        &mut stat.wca,
-                        core_guided_options.coefficient_elimination,
-                        core_guided_options.variable_reformulation,
-                    );
-                    assumptions.extend(new_assum);
-                    current_lower_bound += cost;
-                    stat.tpt.end_task(MonitoredTasks::WCEAdditions);
-                }
-                // Stratification: check if strata still need to be added.
-                if !strat_empty {
-                    stat.tpt.start_task(MonitoredTasks::StrataCreation);
-                    let (new_assum, cost) =
-                        self.process_stratum(&mut unadded_parts_of_objective_function);
-                    assumptions.extend(new_assum);
-                    current_lower_bound += cost;
-                    stat.tpt.end_task(MonitoredTasks::StrataCreation);
-                }
-                // Hardening: add upper bounds explicitly if the objective value improved.
-                if let Some(hi) = harden_info {
-                    let ub = self.upper_bound(&obj_var);
-                    if core_guided_options.harden && hi <= ub {
-                        stat.tpt.start_task(MonitoredTasks::Hardening);
-                        // Check if the objective value is better than our current upper bound
-                        debug!(
-                            "Hardening obj to [{}, {}] (was {})",
-                            self.lower_bound(&obj_var),
-                            hi,
-                            ub
-                        );
-                        self.process_hardening(
-                            hi,
-                            &obj_var,
-                            &objective_terms,
-                            bias,
-                            &weights_per_var,
-                            &mut stat.hdl,
-                        );
-                        stat.tpt.end_task(MonitoredTasks::Hardening);
-                    }
-                }
-                solution = Some(sol);
-            } else {
-                warn!(
-                    "Unreachable state reached: solver terminated in continuation configuration, \
-                but no core or solution was present."
-                )
-            }
+            // If more than 1 partition exists, merge them in a pairwise balanced fashion.
+            indiv_parts = self.merge_partitions(indiv_parts, &mut community_distances, &mut stat);
         }
 
         debug!("Exited loop, returning answer...");
@@ -1245,16 +1122,17 @@ impl Solver {
 
         self.print_statistics(
             stat,
-            if let Some(s) = &solution {
+            partition_time,
+            if let Some(s) = &last_solution {
                 // Restore objective value to original sign.
                 (s.lower_bound(&obj_var) * if _is_maximising { -1 } else { 1 }) as f32
             } else {
                 f32::NAN
             },
-            proven,
+            last_proven,
         );
 
-        match (solution, proven) {
+        match (last_solution, last_proven) {
             // If a solution has been found, and was proven to be optimal, return it as the
             // optimal solution.
             (Some(s), true) => OptimisationResult::Optimal(s),
@@ -1270,21 +1148,244 @@ impl Solver {
         }
     }
 
+    fn perform_cgs<B: Brancher, T: TerminationCondition>(
+        &mut self,
+        obj_var: &AffineView<DomainId>,
+        objective_terms: &[(i32, DomainId)],
+        original_lower_bound: &i32,
+        bias: &i32,
+        current_partition: &mut SinglePartitionData,
+        weights_per_var: &mut HashMap<u32, (i32, i32)>,
+        stat: &mut StatisticsGroup,
+        core_guided_options: &CoreGuidedArgs,
+        brancher: &mut B,
+        termination: &mut T,
+    ) -> (Option<Solution>, bool) {
+        let SinglePartitionData {
+            lower_bound,
+            strata,
+            assumptions,
+            ..
+        } = current_partition;
+        // This boolean signals whether the result of the solver is 'final'; if a solution is found
+        // with no information left to be added, or if unconditional unsatisfiability is found.
+        let mut proven = false;
+        let mut solution: Option<Solution> = None;
+
+        // In the case of weight-aware core extraction (WCE), we fully process a core but don't yet
+        // add the new assumptions. Keep track of the assumptions to be added.
+        // Note: all reformulation variables have weight >=0
+        let mut delayed_assumptions = vec![];
+
+        // Add assumptions which fix all objective variables to their lower bounds;
+        // create literals for these conditions.
+        if assumptions.is_empty() || !strata.is_empty() {
+            let (initial_stratum, _) = strata
+                .pop()
+                .expect("Expected at least 1 objective function term");
+            assumptions.extend(self.create_assumptions_with_lb_diff(initial_stratum).0);
+        }
+        // Repeat until satisfiable
+        loop {
+            let (actual_lb, actual_ub) = (self.lower_bound(obj_var), self.upper_bound(obj_var));
+
+            if *original_lower_bound + *lower_bound - *bias > actual_ub
+                || actual_lb > actual_ub
+                || assumptions.contains(&Literal::u32_to_literal(0))
+            {
+                // If the current estimated lower bound or the actual lower bound exceeds the
+                // actual upper bound, or if one of the assumptions implies false, we have proven
+                // unsatisfiability.
+                info!("Stopping solving process due to violated bounds");
+                debug!(
+                    "est. lb > ub: {}; act. lb > ub: {}; assume false: {}",
+                    *original_lower_bound + *lower_bound - *bias > actual_ub,
+                    actual_lb > actual_ub,
+                    assumptions.contains(&Literal::u32_to_literal(0)),
+                );
+                // If the bounds are violated, this means that all values in the domain of the
+                // objective value are proven infeasible, i.e. the problem is unsatisfiable.
+                proven = true;
+                if solution.is_some() {
+                    // If all values are proven infeasible, but one was found, something's wrong.
+                    proven = false;
+                    warn!("Solution found before UNSAT; closer inspection required.");
+                }
+                break;
+            }
+            let (core, new_sol, unsat_proven) =
+                self.cgs_outcome(assumptions, brancher, termination, stat);
+            if core.is_none() && new_sol.is_none() {
+                if unsat_proven {
+                    if solution.is_some() {
+                        // If the unsatisfiability is unconditional, solution should be None.
+                        warn!("Solution found before UNSAT; closer inspection required.");
+                    }
+                    proven = solution.is_none();
+                }
+                break;
+            }
+
+            if let Some(c) = core {
+                stat.tpt.start_task(MonitoredTasks::CoreProcessing);
+                info!("Processing core of size {}", c.len());
+                stat.cs.core_found(c.len());
+
+                let (add_cost, new_assum) = self.process_core(
+                    &c,
+                    assumptions,
+                    core_guided_options.variable_reformulation,
+                    core_guided_options.coefficient_elimination,
+                    weights_per_var,
+                );
+                stat.tpt.end_task(MonitoredTasks::CoreProcessing);
+
+                // Update lower bound after every core-processing iteration
+                *lower_bound += add_cost;
+                stat.lb.update(*original_lower_bound + *lower_bound);
+
+                // If a new assumption is present, add it in the appropriate place.
+                if let Some((did, lb)) = new_assum {
+                    debug!("Assumption was returned: {:?}", (did, lb));
+                    if core_guided_options.weight_aware_cores {
+                        delayed_assumptions.push((did, lb));
+                    } else {
+                        assumptions.push(self.get_literal(predicate!(did <= lb)));
+                    }
+                }
+            } else if let Some(sol) = new_sol {
+                let new_val = sol.lower_bound(obj_var);
+                debug!("New solution found with objective value {}", new_val);
+
+                // If a solution was found, check if any information was held back. If so, add this
+                // information; if not, report optimality.
+                let (wce_empty, strat_empty) = (delayed_assumptions.is_empty(), strata.is_empty());
+                if wce_empty && strat_empty {
+                    info!("No remaining information, solution is proven to be optimal. Exiting...");
+                    proven = true;
+                    solution = Some(sol); // Restore ownership
+                    break;
+                }
+
+                // WCE: add any previously created reformulation variables.
+                if !wce_empty {
+                    stat.tpt.start_task(MonitoredTasks::WCEAdditions);
+                    let (new_assum, cost) = self.process_wce(
+                        &mut delayed_assumptions,
+                        weights_per_var,
+                        &mut stat.wca,
+                        core_guided_options.coefficient_elimination,
+                        core_guided_options.variable_reformulation,
+                    );
+                    assumptions.extend(new_assum);
+                    *lower_bound += cost;
+                    stat.tpt.end_task(MonitoredTasks::WCEAdditions);
+                }
+                // Stratification: check if strata still need to be added.
+                if !strat_empty {
+                    stat.tpt.start_task(MonitoredTasks::StrataCreation);
+                    let (new_assum, cost) = self.process_stratum(strata);
+                    assumptions.extend(new_assum);
+                    *lower_bound += cost;
+                    stat.tpt.end_task(MonitoredTasks::StrataCreation);
+                }
+
+                // Hardening: add upper bounds explicitly if the objective value improved.
+                let best_solution = match solution {
+                    // Note: minimisation, so "better" means that `old_obj < new_obj`.
+                    Some(old_sol) if old_sol.lower_bound(obj_var) <= new_val => {
+                        debug!("Keeping old solution");
+                        old_sol
+                    }
+                    _ => {
+                        debug!("Using new solution as best so far");
+                        // Check if the objective value is better than our current upper bound.
+                        // If so, perform hardening.
+                        if core_guided_options.harden && new_val <= actual_ub {
+                            stat.tpt.start_task(MonitoredTasks::Hardening);
+                            debug!(
+                                "Hardening obj to [{}, {}] (was {})",
+                                self.lower_bound(obj_var),
+                                new_val,
+                                actual_ub,
+                            );
+                            self.process_hardening(
+                                new_val,
+                                obj_var,
+                                objective_terms,
+                                *bias,
+                                weights_per_var,
+                                &mut stat.hdl,
+                            );
+                            stat.tpt.end_task(MonitoredTasks::Hardening);
+                        }
+                        sol
+                    }
+                };
+                solution = Some(best_solution);
+            } else {
+                warn!(
+                    "Unreachable state reached: solver terminated in continuation configuration, \
+                but no core or solution was present."
+                )
+            }
+        }
+        (solution, proven)
+    }
+
+    fn cgs_outcome<B: Brancher, T: TerminationCondition>(
+        &mut self,
+        assumptions: &[Literal],
+        brancher: &mut B,
+        termination: &mut T,
+        stat: &mut StatisticsGroup,
+    ) -> (Option<Box<[Literal]>>, Option<Solution>, bool) {
+        // Check satisfiability under current assumptions.
+        stat.tpt.start_task(MonitoredTasks::Solving);
+        let solv_res = self.satisfy_under_assumptions(brancher, termination, assumptions);
+        stat.tpt.end_task(MonitoredTasks::Solving);
+
+        match solv_res {
+            // If a solution is found, check if it's better than the previous solution
+            // (if any), save the best of the two and report absence of a core.
+            SatisfactionResultUnderAssumptions::Satisfiable(sol) => (None, Some(sol), false),
+            // Stop optimisation if Unknown is returned (presumably due to timeout).
+            SatisfactionResultUnderAssumptions::Unknown => {
+                info!("Result Unknown returned; presumably timeout");
+                (None, None, false)
+            }
+            // If the solver reports (unconditional) unsatisfiability, we have proven that
+            // the base problem is unsatisfiable. Report this.
+            SatisfactionResultUnderAssumptions::Unsatisfiable => {
+                info!("UNSAT proven; exiting...");
+                (None, None, true)
+            }
+            // If assumptions cause unsatisfiability, extract the UNSAT core.
+            SatisfactionResultUnderAssumptions::UnsatisfiableUnderAssumptions(
+                mut core_extractor,
+            ) => {
+                debug!("Core found");
+                (Some(core_extractor.extract_core()), None, false)
+            }
+        }
+    }
+
     /// After the optimisation process, many statistics have been collected. This function accepts
     /// those statistics as arguments and prints all relevant (raw and aggregated) data.
-    fn print_statistics(&mut self, stat: StatisticsGroup, obj: f32, proven: bool) {
+    fn print_statistics(&mut self, stat: StatisticsGroup, time_part: u128, obj: f32, proven: bool) {
         let (lb_res, core_res, task_res, wce_res, hard_res) = stat.get_results();
         let (lb_vals, lb_times): (Vec<i32>, Vec<u128>) = lb_res.into_iter().unzip();
 
         println!(
             "The following custom statistics were collected:\n\
+            Partitioning Time: {:?}\n\
             Lower Bound Valuess: {:?}\n\
             Lower Bound Times: {:?}\n\
             Core Size: {:?}\n\
             Time per Task: {:?}\n\
             Number of Disjoint Cores between Reformulations: {:?}\n\
             Remaining Domain Fractions after Hardening: {:?}",
-            lb_vals, lb_times, core_res, task_res, wce_res, hard_res,
+            time_part, lb_vals, lb_times, core_res, task_res, wce_res, hard_res,
         );
 
         let core_len = core_res.len();
@@ -1331,7 +1432,8 @@ impl Solver {
         let time_core = *task_res.get(&MonitoredTasks::CoreProcessing).unwrap_or(&0);
         let time_spec = *task_res.get(&MonitoredTasks::WCEAdditions).unwrap_or(&0)
             + *task_res.get(&MonitoredTasks::StrataCreation).unwrap_or(&0)
-            + *task_res.get(&MonitoredTasks::Hardening).unwrap_or(&0);
+            + *task_res.get(&MonitoredTasks::Hardening).unwrap_or(&0)
+            + time_part;
 
         let wce_len = wce_res.len() as f32;
         let core_per_reform = wce_res.into_iter().map(|x| x as i32).sum::<i32>() as f32 / wce_len;
@@ -1947,6 +2049,107 @@ impl Solver {
             })
             .collect()
     }
+
+    /// A function that merges [`SinglePartitionData`]s in a pairwise version. Finds the strongest
+    /// connections between partitions as recorded in `community_distances` and combines their
+    /// information into a single new partition, with the ID of the lower of the two partitions.
+    fn merge_partitions(
+        &self,
+        mut old_indiv_parts: Vec<SinglePartitionData>,
+        community_distances: &mut HashMap<i32, HashMap<i32, f32>>,
+        stat: &mut StatisticsGroup,
+    ) -> Vec<SinglePartitionData> {
+        stat.tpt.start_task(MonitoredTasks::Partitioning);
+        let mut new_indiv_parts = vec![];
+        let mut prev_selected = HashSet::new();
+        while old_indiv_parts.len() > 1 {
+            // Find the two closest partitions, i.e. max weight of connection.
+            let (_, c1, c2) = community_distances
+                .iter()
+                .flat_map(|(comm, cds)| cds.iter().map(move |(c, dst)| (dst, comm, c)))
+                .filter(|(_, c1, c2)| {
+                    // Remove partitions which have already been selected.
+                    !prev_selected.contains(*c1) && !prev_selected.contains(*c2)
+                })
+                .max_by(|(dst1, _, _), (dst2, _, _)| dst1.partial_cmp(dst2).unwrap())
+                .unwrap();
+
+            debug!("Merging partitions {:?} and {:?}", c1, c2);
+            // Find and remove selected partitions (note; find second index only after.
+            let idx1 = old_indiv_parts
+                .iter()
+                .position(|spd| spd.partition_id == *c1)
+                .unwrap();
+            let SinglePartitionData {
+                strata: mut strata1,
+                assumptions: mut ass1,
+                lower_bound: lb1,
+                ..
+            } = old_indiv_parts.remove(idx1);
+            let idx2 = old_indiv_parts
+                .iter()
+                .position(|spd| spd.partition_id == *c2)
+                .unwrap();
+            let SinglePartitionData {
+                strata: strata2,
+                assumptions: ass2,
+                lower_bound: lb2,
+                ..
+            } = old_indiv_parts.remove(idx2);
+
+            // Combine information from partitions and assign to the smallest of the two.
+            let (min_c, max_c) = (min(*c1, *c2), max(*c1, *c2));
+            ass1.extend(ass2);
+            strata1.extend(strata2);
+            strata1.sort_by(|(_, w1), (_, w2)| w1.cmp(w2));
+            new_indiv_parts.push(SinglePartitionData {
+                partition_id: min_c,
+                strata: strata1,
+                assumptions: ass1,
+                lower_bound: lb1 + lb2,
+            });
+            assert!(prev_selected.insert(min_c));
+
+            // Update connection weights between the new community and the others.
+            community_distances.iter_mut().for_each(|(k, v)| {
+                if *k != min_c && *k != max_c {
+                    // Find all elements which are not currently considered, and update the weights
+                    // to the sums of the individual connections to both partitions.
+                    *v.get_mut(&min_c).unwrap() += v[&max_c];
+                }
+                // Remove old connection.
+                let _ = v.remove(&max_c);
+            });
+            // For the currently considered partitions: remove the old one, and add all connection
+            // weights to the pre-existing connections of the old partitions.
+            let old_dist = community_distances.remove(&max_c).unwrap();
+            community_distances
+                .get_mut(&min_c)
+                .unwrap()
+                .iter_mut()
+                .for_each(|(k, v)| {
+                    if *k != max_c {
+                        *v += old_dist[k];
+                    }
+                });
+            debug!(
+                "Merge done, {} partitions left to merge",
+                old_indiv_parts.len()
+            );
+        }
+        // If a single element is left, it can't be merged and is transferred individually.
+        if !old_indiv_parts.is_empty() {
+            let p = old_indiv_parts.pop().unwrap();
+            debug!("Transferring last partition: {}", p.partition_id);
+            new_indiv_parts.push(p);
+        }
+        stat.tpt.start_task(MonitoredTasks::Partitioning);
+        debug!(
+            "Merging complete, {} partitions are currently being considered",
+            new_indiv_parts.len()
+        );
+        new_indiv_parts
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -1959,4 +2162,26 @@ pub struct CoreGuidedArgs {
     pub weight_aware_cores: bool,
     pub stratification: bool,
     pub harden: bool,
+    pub partition: bool,
+}
+
+/// An objective function is (generally) defined as `obj = \Sigma_i w_i*x_i + bias`. This type
+/// definition allows this full objective function to be contained in a single object.
+pub type ObjectiveDefinition = (Vec<(i32, DomainId)>, i32);
+
+/// All data for a single partition.
+#[derive(Debug)]
+pub(crate) struct SinglePartitionData {
+    partition_id: i32,
+    strata: Vec<(Vec<VarWithBound>, i32)>,
+    assumptions: Vec<Literal>,
+    lower_bound: i32,
+}
+
+/// Data struct which encapsulates the result of partitioning.
+#[derive(Debug)]
+pub struct PartitionedInstanceData {
+    pub communities: HashMap<i32, Vec<DomainId>>,
+    pub community_distances: HashMap<i32, HashMap<i32, f32>>,
+    pub time_taken: u128,
 }

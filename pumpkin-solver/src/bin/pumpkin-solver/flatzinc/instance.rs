@@ -3,6 +3,8 @@ use std::fmt::Write;
 use std::rc::Rc;
 
 use pumpkin_solver::branching::branchers::dynamic_brancher::DynamicBrancher;
+use pumpkin_solver::options::ObjectiveDefinition;
+use pumpkin_solver::options::PartitionedInstanceData;
 use pumpkin_solver::variables::DomainId;
 use pumpkin_solver::variables::Literal;
 
@@ -25,16 +27,13 @@ impl FlatzincObjective {
     }
 }
 
-/// An objective function is (generally) defined as `obj = \Sigma_i w_i*x_i + bias`. This type
-/// definition allows this full objective function to be contained in a single object.
-pub(crate) type ObjectiveDefinition = (Vec<(i32, DomainId)>, i32);
-
 #[derive(Default)]
 pub(crate) struct FlatZincInstance {
     pub(super) outputs: Vec<Output>,
     pub(super) objective_function: Option<FlatzincObjective>,
     pub(super) search: Option<DynamicBrancher>,
     pub(super) objective_definition: Option<ObjectiveDefinition>,
+    pub(super) partitioned_instance: Option<PartitionedInstanceData>,
 }
 
 impl FlatZincInstance {

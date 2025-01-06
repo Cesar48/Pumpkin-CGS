@@ -76,7 +76,13 @@ pub(crate) fn solve(
         time_limit.map(TimeBudget::starting_now),
     );
 
-    let instance = parse_and_compile(&mut solver, instance, options)?;
+    let partition = if let Some(cgs) = core_guided_options {
+        cgs.partition
+    } else {
+        false
+    };
+
+    let instance = parse_and_compile(&mut solver, instance, options, partition)?;
     let outputs = instance.outputs.clone();
 
     let mut brancher = if options.free_search {
@@ -105,6 +111,7 @@ pub(crate) fn solve(
                 *domain_id,
                 core_guided_options,
                 instance.objective_definition,
+                instance.partitioned_instance,
             ),
             FlatzincObjective::Minimize(domain_id) => solver.minimise(
                 &mut brancher,
@@ -112,6 +119,7 @@ pub(crate) fn solve(
                 *domain_id,
                 core_guided_options,
                 instance.objective_definition,
+                instance.partitioned_instance,
             ),
         };
 
@@ -220,9 +228,10 @@ fn parse_and_compile(
     solver: &mut Solver,
     instance: impl Read,
     options: FlatZincOptions,
+    apply_partitioning: bool,
 ) -> Result<FlatZincInstance, FlatZincError> {
     let ast = parser::parse(instance)?;
-    compiler::compile(ast, solver, options)
+    compiler::compile(ast, solver, options, apply_partitioning)
 }
 
 /// Prints the current solution.

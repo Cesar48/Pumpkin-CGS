@@ -5,6 +5,7 @@ use std::rc::Rc;
 use pumpkin_solver::constraints;
 use pumpkin_solver::constraints::Constraint;
 use pumpkin_solver::constraints::NegatableConstraint;
+use pumpkin_solver::options::ObjectiveDefinition;
 use pumpkin_solver::predicate;
 use pumpkin_solver::variables::AffineView;
 use pumpkin_solver::variables::DomainId;
@@ -15,7 +16,6 @@ use super::context::CompilationContext;
 use crate::flatzinc::ast::FlatZincAst;
 use crate::flatzinc::compiler::context::Set;
 use crate::flatzinc::instance::FlatzincObjective;
-use crate::flatzinc::instance::ObjectiveDefinition;
 use crate::flatzinc::FlatZincError;
 use crate::flatzinc::FlatZincOptions;
 

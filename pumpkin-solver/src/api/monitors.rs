@@ -123,6 +123,7 @@ pub(crate) enum MonitoredTasks {
     WCEAdditions,
     StrataCreation,
     Hardening,
+    Partitioning,
 }
 
 /// A struct for keeping track of the time spent on every notable task.
