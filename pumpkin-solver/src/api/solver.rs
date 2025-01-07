@@ -2143,7 +2143,7 @@ impl Solver {
             debug!("Transferring last partition: {}", p.partition_id);
             new_indiv_parts.push(p);
         }
-        stat.tpt.start_task(MonitoredTasks::Partitioning);
+        stat.tpt.end_task(MonitoredTasks::Partitioning);
         debug!(
             "Merging complete, {} partitions are currently being considered",
             new_indiv_parts.len()

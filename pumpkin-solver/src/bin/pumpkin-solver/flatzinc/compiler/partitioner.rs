@@ -5,6 +5,7 @@ use std::hash::RandomState;
 use std::time::Instant;
 
 use flatzinc::ConstraintItem;
+use log::debug;
 use log::info;
 use louvain::modularity::Modularity;
 use petgraph::graph::NodeIndex;
@@ -44,7 +45,7 @@ pub(crate) fn create_partition_and_process_instance(
         graph,
         var_to_vtxid,
         ..
-    } = create_graph_representation(ast, context)?;
+    } = create_graph_representation(ast, context, obj)?;
     let communities = partition_graph(&graph);
 
     // Convert the `communities` map to a map from community ID (i32) to nodes (NodeIndex) for more
@@ -88,6 +89,7 @@ pub(crate) fn create_partition_and_process_instance(
         });
 
     info!("Created {} communities", relevant_communities.len());
+    debug!("{:?}", relevant_communities);
     Ok(PartitionedInstanceData {
         communities: relevant_communities,
         community_distances: community_dist,
@@ -101,11 +103,18 @@ pub(crate) fn create_partition_and_process_instance(
 pub(crate) fn create_graph_representation(
     ast: &FlatZincAst,
     context: &mut CompilationContext,
+    obj: &[(i32, DomainId)],
 ) -> Result<PartitionerData, FlatZincError> {
     let mut graph = PetGraph::new_undirected();
     // Keep track of all vertex ID's for every variable and literal we've covered.
     let mut var_to_vtxid = HashMap::default();
     let mut lit_to_vtxid = HashMap::default();
+
+    for (_, o) in obj {
+        // Ensure all objective variables are present. It might in some cases be that no constraints
+        // use a given o; this means it will not appear in cores, but we still need to consider it.
+        assert!(var_to_vtxid.insert(o.clone(), graph.add_node(1)).is_none());
+    }
 
     // Iterate over the constraints; most constraints need to be handled differently, depending on
     // variable layout and relationship strength - this is similar on only some constraints.
@@ -365,8 +374,7 @@ pub(crate) fn create_graph_representation(
                     .map(|lit| &lit_to_vtxid[&lit])
                     .collect::<Vec<_>>();
                 let vtxs_len = vtxs.len();
-                let _ =
-                    add_weighted_edge_linear(&mut graph, vtx_id, vtxs, &vec![1; vtxs_len], 0);
+                let _ = add_weighted_edge_linear(&mut graph, vtx_id, vtxs, &vec![1; vtxs_len], 0);
             }
             "set_in_reif" => {
                 let var = context.resolve_integer_variable(&exprs[0])?;
@@ -445,9 +453,15 @@ fn add_weighted_edge_global_constraint(
 ) -> f32 {
     let var_len = variables.len() as i32;
     let w = 0.9_f32.powi(var_len);
-    for v in variables {
+    for v in variables.into_iter() {
         let mult = graph.node_weight(*v).unwrap();
-        let _ = graph.add_edge(vertex, *v, w * (*mult as f32));
+        let total_w = w * (*mult as f32);
+        match graph.find_edge(vertex, *v) {
+            None => {
+                let _ = graph.add_edge(vertex, *v, total_w);
+            }
+            Some(e) => *graph.edge_weight_mut(e).unwrap() += total_w,
+        }
     }
     w * var_len as f32
 }
@@ -473,9 +487,15 @@ fn add_weighted_edge_linear(
         .iter()
         .map(|x| (*x as f32 / div as f32).abs())
         .collect::<Vec<_>>();
-    for (&v, w) in variables.iter().zip(rel_weights.iter()) {
+    for (v, w) in variables.into_iter().zip(rel_weights.iter()) {
         let mult = graph.node_weight(*v).unwrap();
-        let _ = graph.add_edge(vertex, *v, *w * (*mult as f32));
+        let total_w = w * (*mult as f32);
+        match graph.find_edge(vertex, *v) {
+            None => {
+                let _ = graph.add_edge(vertex, *v, total_w);
+            }
+            Some(e) => *graph.edge_weight_mut(e).unwrap() += total_w,
+        }
     }
     rel_weights.iter().sum::<f32>()
 }
