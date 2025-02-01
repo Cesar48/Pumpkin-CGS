@@ -1107,9 +1107,10 @@ impl Solver {
                     break;
                 }
             }
-            if indiv_parts.len() == 1 {
+            if indiv_parts.len() == 1 || (last_solution.is_none() && last_proven) {
                 debug!("Full problem solved; returning");
                 // Only 1 partition? That's the full problem. Return outcome.
+                // UNSAT proven for partition? That's UNSAT for the full problem. Also return.
                 break;
             }
 
