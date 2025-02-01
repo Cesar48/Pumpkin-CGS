@@ -88,12 +88,13 @@ pub(crate) fn create_partition_and_process_instance(
                 })
         });
 
-    info!("Created {} communities", relevant_communities.len());
+    let time = start.elapsed().as_micros();
+    info!("Created {} communities in {} micros", relevant_communities.len(), time);
     debug!("{:?}", relevant_communities);
     Ok(PartitionedInstanceData {
         communities: relevant_communities,
         community_distances: community_dist,
-        time_taken: start.elapsed().as_micros(),
+        time_taken: time,
     })
 }
 
