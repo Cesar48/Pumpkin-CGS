@@ -15,6 +15,7 @@ As part of the research developing this implementation, four additional features
  - Stratification, enabled through flag `--strat` (used previously in Gange et al. 2020)
  - Hardening, enabled through flag `--harden` (used previously in Gange et al. 2020)
  - Partitioning, enabled through flag `--partition` (newly implemented based on Open-WBO, Neves et al. 2015)
+
 These features are compatible with one another, though combining partitioning with stratification is not recommended: as both consider only a (small) part of the objective function at first, this causes very relaxed versions of the problem to be considered at first. This can be detrimental to the search process. Additionally, WCE and stratification both progress as soon as an intermediate solution is discovered, even if progressing just one of the techniques would allow new cores to be discovered. This may have unintended side effects, though we expect there to still be significant benefits in most cases.
 
 
